@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../db/offlineDb';
-import { syncPendingLots } from '../services/syncManager';
+import { retryAllPendingLots, syncPendingLots } from '../services/syncManager';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 const msp = { WHEAT:2425,PADDY_COMMON:2369,SOYBEAN:4892,MUSTARD:5950,CHICKPEA:5650 };
@@ -17,6 +17,11 @@ export default function FarmerDashboard({ user, onPendingChange }) {
   const [lots, setLots] = useState([]);
   const [queue, setQueue] = useState([]);
   const [message, setMessage] = useState('');
+  const [foreignMatter, setForeignMatter] = useState(1.2);
+  const [brokenGrain, setBrokenGrain] = useState(0.8);
+  const [capturedPhoto, setCapturedPhoto] = useState('');
+  const [latitude, setLatitude] = useState(null);
+  const [longitude, setLongitude] = useState(null);
   const [crops, setCrops] = useState([
     { code:'WHEAT', name:'Wheat' },{ code:'PADDY_COMMON', name:'Paddy (Common)' },
     { code:'SOYBEAN', name:'Soybean' },{ code:'MUSTARD', name:'Mustard' },{ code:'CHICKPEA', name:'Chickpea' }
@@ -55,7 +60,6 @@ export default function FarmerDashboard({ user, onPendingChange }) {
     } catch {}
   };
 
-  const floor = useMemo(async () => null, []);
   const [calculated, setCalculated] = useState(null);
   useEffect(() => {
     (async () => {
@@ -71,11 +75,34 @@ export default function FarmerDashboard({ user, onPendingChange }) {
 
   const registerLot = async event => {
     event.preventDefault();
+    if (foreignMatter < 0 || foreignMatter > 100 || brokenGrain < 0 || brokenGrain > 100) {
+      setMessage('Quality percentages must be between 0 and 100.');
+      return;
+    }
+    let captureLatitude = latitude;
+    let captureLongitude = longitude;
+    if (navigator.geolocation) {
+      try {
+        const position = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, { timeout:5000, maximumAge:60000 }));
+        captureLatitude = position.coords.latitude;
+        captureLongitude = position.coords.longitude;
+        setLatitude(captureLatitude);
+        setLongitude(captureLongitude);
+      } catch {}
+    }
     const record = {
       clientEventId:uuidv4(), cropCode:crop, quantityQuintals:Number(quantity),
       moisturePct:Number(moisture), grade, districtId:district,
       capturedAt:new Date().toISOString(), syncStatus:'PENDING', lastError:'',
-      qualityCard:{ foreignMatterPct:1.2, brokenGrainPct:.8, assayedBy:'Farmer mobile assay' }
+      attemptCount:0,
+      captureLatitude,
+      captureLongitude,
+      qualityCard:{
+        foreignMatterPct:Number(foreignMatter),
+        brokenGrainPct:Number(brokenGrain),
+        photoDataUrl:capturedPhoto || null,
+        assayedBy:'Farmer mobile assay'
+      }
     };
     await db.pendingLots.add(record);
     setMessage(navigator.onLine ? 'Lot queued; syncing now.' : 'Lot saved locally. It will sync automatically.');
@@ -94,6 +121,33 @@ export default function FarmerDashboard({ user, onPendingChange }) {
     link.href = url; link.download = 'agripulse-lots.csv'; link.click(); URL.revokeObjectURL(url);
   };
 
+  const capturePhoto = async event => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setMessage('Only image photos can be attached.');
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setMessage('Photo must be smaller than 2 MB.');
+      return;
+    }
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    setCapturedPhoto(dataUrl);
+  };
+
+  const retryQueue = async () => {
+    setMessage('Retrying queued lots...');
+    await retryAllPendingLots();
+    await refresh();
+    await onPendingChange?.();
+  };
+
   return (
     <div className="grid gap-6 lg:grid-cols-3">
       <section className="rounded-xl border bg-white p-5 shadow-sm">
@@ -110,12 +164,18 @@ export default function FarmerDashboard({ user, onPendingChange }) {
         <h2 className="text-xl font-black">Register Harvest Lot</h2>
         <form onSubmit={registerLot} className="mt-4 space-y-3">
           <input type="number" min="1" max="2000" required value={quantity} onChange={e=>setQuantity(e.target.value)} placeholder="Quantity in quintals" className="w-full rounded border p-3"/>
+          <div className="grid grid-cols-2 gap-3">
+            <input type="number" min="0" max="100" required value={foreignMatter} onChange={e=>setForeignMatter(e.target.value)} placeholder="Foreign matter %" className="w-full rounded border p-3"/>
+            <input type="number" min="0" max="100" required value={brokenGrain} onChange={e=>setBrokenGrain(e.target.value)} placeholder="Broken grain %" className="w-full rounded border p-3"/>
+          </div>
+          <input type="file" accept="image/*" capture="environment" onChange={capturePhoto} className="w-full rounded border p-2 text-sm"/>
+          {capturedPhoto && <img src={capturedPhoto} alt="Lot preview" className="h-28 w-full rounded object-cover"/>}
           <button className="w-full rounded-lg bg-emerald-700 py-3 font-bold text-white">Save & Sync Lot</button>
         </form>
         {message && <p className="mt-3 text-sm font-semibold text-emerald-700">{message}</p>}
       </section>
       <section className="rounded-xl border bg-white p-5 shadow-sm">
-        <h2 className="text-xl font-black">Sync Queue</h2>
+        <div className="flex items-center justify-between"><h2 className="text-xl font-black">Sync Queue</h2><button onClick={retryQueue} className="text-xs font-bold text-emerald-800">Retry All</button></div>
         <div className="mt-3 space-y-2">{queue.map(r=><div key={r.localId} className="rounded-lg border p-3 text-sm"><b>{r.cropCode}</b> · {r.quantityQuintals}q <span className={`float-right rounded px-2 py-1 text-xs ${r.syncStatus==='ERROR'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-800'}`}>{r.syncStatus}</span>{r.lastError&&<p className="mt-1 text-xs text-red-600">{r.lastError}</p>}</div>)}</div>
       </section>
       <section className="lg:col-span-3 rounded-xl border bg-white p-5 shadow-sm">

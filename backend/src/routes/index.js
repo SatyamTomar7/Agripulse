@@ -279,6 +279,20 @@ router.post('/lots/sync', verifyToken, requireRole('FARMER','FPO_ADMIN'), async 
         if (!isUuidV4(lot.clientEventId)) throw Object.assign(new Error('Invalid UUIDv4 clientEventId'), { status: 400, code: 'INVALID_UUID' });
         validatePrice(lot.cropCode, lot.grade, lot.moisturePct);
         if (!Number.isFinite(Number(lot.quantityQuintals)) || Number(lot.quantityQuintals) <= 0 || Number(lot.quantityQuintals) > 2000) throw Object.assign(new Error('Invalid quantity'), { status: 400, code: 'INVALID_QUANTITY' });
+        const district = await client.query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [lot.districtId]);
+        if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400, code: 'INVALID_DISTRICT' });
+        if (lot.capturedAt && Number.isNaN(Date.parse(lot.capturedAt))) throw Object.assign(new Error('Invalid capture timestamp'), { status: 400, code: 'INVALID_CAPTURE_DATE' });
+        if (lot.captureLatitude != null && (Number(lot.captureLatitude) < -90 || Number(lot.captureLatitude) > 90)) throw Object.assign(new Error('Invalid capture latitude'), { status: 400, code: 'INVALID_LOCATION' });
+        if (lot.captureLongitude != null && (Number(lot.captureLongitude) < -180 || Number(lot.captureLongitude) > 180)) throw Object.assign(new Error('Invalid capture longitude'), { status: 400, code: 'INVALID_LOCATION' });
+        const qualityCard = lot.qualityCard || {};
+        for (const key of ['foreignMatterPct','brokenGrainPct']) {
+          if (qualityCard[key] != null && (!Number.isFinite(Number(qualityCard[key])) || Number(qualityCard[key]) < 0 || Number(qualityCard[key]) > 100)) {
+            throw Object.assign(new Error(`Invalid ${key}`), { status: 400, code: 'INVALID_QUALITY_CARD' });
+          }
+        }
+        if (typeof qualityCard.photoDataUrl === 'string' && qualityCard.photoDataUrl.length > 280000) {
+          throw Object.assign(new Error('Attached photo is too large'), { status: 413, code: 'PHOTO_TOO_LARGE' });
+        }
         if (duplicates.has(lot.clientEventId)) continue;
         const districtPrice = await priceCache.getPrice(lot.districtId, lot.cropCode);
         const floor = calculateFloor({ cropCode: lot.cropCode, mandiModalInr: districtPrice.mandiModalInr, grade: lot.grade, moisturePct: lot.moisturePct });

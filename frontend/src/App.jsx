@@ -23,9 +23,9 @@ export default function App() {
     window.addEventListener('online', updateNetwork);
     window.addEventListener('offline', updateNetwork);
     const stopSync = startSyncManager(async () => {
-      setPendingCount(await db.pendingLots.where('syncStatus').equals('PENDING').count());
+      setPendingCount(await db.pendingLots.count());
     });
-    db.pendingLots.where('syncStatus').equals('PENDING').count().then(setPendingCount);
+    db.pendingLots.count().then(setPendingCount);
     return () => {
       window.removeEventListener('online', updateNetwork);
       window.removeEventListener('offline', updateNetwork);
@@ -33,7 +33,8 @@ export default function App() {
     };
   }, []);
 
-  const refreshPending = async () => setPendingCount(await db.pendingLots.where('syncStatus').equals('PENDING').count());
+  const refreshPending = async () => setPendingCount(await db.pendingLots.count());
+
   const logout = () => {
     const refreshToken = localStorage.getItem('agripulse_refresh_token');
     if (refreshToken) axios.post(`${API}/api/v1/auth/logout`, { refreshToken }).catch(() => {});
