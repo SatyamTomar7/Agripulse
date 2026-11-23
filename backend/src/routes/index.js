@@ -755,16 +755,159 @@ router.post('/auctions/:auctionId/accept', verifyToken, requireRole('FARMER','FP
     );
     await client.query(`INSERT INTO escrow_dispatches(auction_id,buyer_id,farmer_id,total_amount_inr) VALUES($1,$2,$3,$4)
       ON CONFLICT(auction_id) DO NOTHING`, [auction.id, auction.highest_bidder_id, auction.farmer_id, auction.current_highest_bid_inr]);
+    const commission = Number((Number(auction.current_highest_bid_inr) * 0.01).toFixed(2));
+    const payable = Number((Number(auction.current_highest_bid_inr) - commission).toFixed(2));
+    await client.query(
+      `INSERT INTO payment_transactions(auction_id,buyer_id,amount_inr,commission_inr,payable_to_farmer_inr,status,invoice_no)
+       VALUES($1,$2,$3,$4,$5,'PENDING',$6)
+       ON CONFLICT(auction_id) DO NOTHING`,
+      [auction.id, auction.highest_bidder_id, auction.current_highest_bid_inr, commission, payable, `AGP-${Date.now()}-${auction.id}`]
+    );
     await client.query('COMMIT');
     req.app.get('io')?.emit('auction:closed', { auctionId: auction.id, lotId: auction.lot_id });
     res.json({ success: true, auctionId: auction.id, status: 'CLOSED' });
   } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
 
-router.get('/dispatches', async (req, res, next) => {
+router.get('/dispatches', verifyToken, async (req, res, next) => {
   try {
-    const result = await query('SELECT * FROM escrow_dispatches ORDER BY id DESC');
+    const params = [];
+    let where = '';
+    if (req.user?.role === 'BUYER') {
+      params.push(req.user.id); where = `WHERE buyer_id=$${params.length}`;
+    } else if (req.user?.role === 'FARMER') {
+      params.push(req.user.id); where = `WHERE farmer_id=$${params.length}`;
+    }
+    const result = await query(`SELECT * FROM escrow_dispatches ${where} ORDER BY id DESC`, params);
     res.json({ dispatches: result.rows });
+  } catch (err) { next(err); }
+});
+
+router.post('/payments/authorize', verifyToken, requireRole('BUYER'), async (req, res, next) => {
+  try {
+    const auctionId = Number(req.body.auctionId);
+    if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
+    const result = await query(
+      `SELECT pt.*,a.status AS auction_status,a.highest_bidder_id
+       FROM payment_transactions pt JOIN auctions a ON a.id=pt.auction_id
+       WHERE pt.auction_id=$1`,
+      [auctionId]
+    );
+    if (!result.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
+    const payment = result.rows[0];
+    if (payment.buyer_id !== req.user.id || payment.highest_bidder_id !== req.user.id) throw Object.assign(new Error('You are not the winning buyer'), { status: 403 });
+    if (!['PENDING','FAILED'].includes(payment.status)) throw Object.assign(new Error('Payment is already authorized or processed'), { status: 409 });
+    const providerReference = req.body.providerReference?.trim() || `AP-${crypto.randomUUID()}`;
+    const resultUpdate = await query(
+      `UPDATE payment_transactions SET status='AUTHORIZED',provider='${String(req.body.provider || 'MANUAL').replace(/[^A-Za-z0-9_-]/g,'').slice(0,30)}',
+       provider_reference=$1,provider_payload=$2,updated_at=NOW() WHERE id=$3 RETURNING *`,
+      [providerReference, JSON.stringify(req.body.providerPayload || {}), payment.id]
+    );
+    res.json({ payment:resultUpdate.rows[0] });
+  } catch (err) { next(err); }
+});
+
+router.post('/payments/:transactionId/capture', verifyToken, requireRole('BUYER'), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const id = Number(req.params.transactionId);
+    const paymentResult = await client.query('SELECT * FROM payment_transactions WHERE id=$1 FOR UPDATE', [id]);
+    if (!paymentResult.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
+    const payment = paymentResult.rows[0];
+    if (payment.buyer_id !== req.user.id) throw Object.assign(new Error('Forbidden'), { status: 403 });
+    if (!['AUTHORIZED','PENDING'].includes(payment.status)) throw Object.assign(new Error(`Payment cannot be captured from ${payment.status}`), { status: 409 });
+    const updated = await client.query(
+      `UPDATE payment_transactions SET status='LOCKED',updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [id]
+    );
+    await client.query(
+      `UPDATE escrow_dispatches SET escrow_status='LOCKED',updated_at=NOW()
+       WHERE auction_id=$1`,
+      [payment.auction_id]
+    );
+    await client.query('COMMIT');
+    res.json({ payment:updated.rows[0] });
+  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
+});
+
+router.post('/payments/:transactionId/refund', verifyToken, requireRole('BUYER','ADMIN'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.transactionId);
+    const paymentResult = await query('SELECT * FROM payment_transactions WHERE id=$1', [id]);
+    if (!paymentResult.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
+    const payment = paymentResult.rows[0];
+    if (req.user.role !== 'ADMIN' && payment.buyer_id !== req.user.id) throw Object.assign(new Error('Forbidden'), { status: 403 });
+    if (!['LOCKED','AUTHORIZED','CAPTURED'].includes(payment.status)) throw Object.assign(new Error(`Payment cannot be refunded from ${payment.status}`), { status: 409 });
+    const result = await query(
+      `UPDATE payment_transactions SET status='REFUND_PENDING',provider_payload=provider_payload||$1,updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [JSON.stringify({ refundReason:req.body.reason?.trim() || 'Buyer refund requested' }), id]
+    );
+    await query(`UPDATE escrow_dispatches SET escrow_status='REFUNDED',updated_at=NOW() WHERE auction_id=$1`, [payment.auction_id]);
+    res.json({ payment:result.rows[0] });
+  } catch (err) { next(err); }
+});
+
+router.post('/payments/:transactionId/release', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const id = Number(req.params.transactionId);
+    const paymentResult = await client.query('SELECT * FROM payment_transactions WHERE id=$1 FOR UPDATE', [id]);
+    if (!paymentResult.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
+    const payment = paymentResult.rows[0];
+    if (!['LOCKED','CAPTURED'].includes(payment.status)) throw Object.assign(new Error(`Payment cannot be released from ${payment.status}`), { status: 409 });
+    const dispatch = await client.query('SELECT logistics_status FROM escrow_dispatches WHERE auction_id=$1', [payment.auction_id]);
+    if (!dispatch.rows.length || dispatch.rows[0].logistics_status !== 'DELIVERED') throw Object.assign(new Error('Escrow can only be released after delivery'), { status: 409 });
+    const updated = await client.query(`UPDATE payment_transactions SET status='RELEASED',updated_at=NOW() WHERE id=$1 RETURNING *`, [id]);
+    await client.query(`UPDATE escrow_dispatches SET escrow_status='RELEASED',updated_at=NOW() WHERE auction_id=$1`, [payment.auction_id]);
+    await client.query('COMMIT');
+    res.json({ payment:updated.rows[0] });
+  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
+});
+
+router.get('/payments', verifyToken, async (req, res, next) => {
+  try {
+    const params = [];
+    let where = '';
+    if (req.user.role === 'BUYER') { params.push(req.user.id); where=`WHERE pt.buyer_id=$${params.length}`; }
+    if (req.user.role === 'FARMER') {
+      params.push(req.user.id);
+      where=`WHERE ed.farmer_id=$${params.length}`;
+    }
+    const result = await query(
+      `SELECT pt.*,ed.farmer_id,ed.logistics_status
+       FROM payment_transactions pt LEFT JOIN escrow_dispatches ed ON ed.auction_id=pt.auction_id
+       ${where} ORDER BY pt.created_at DESC`,
+      params
+    );
+    res.json({ payments:result.rows });
+  } catch (err) { next(err); }
+});
+
+router.post('/payments/webhook', async (req, res, next) => {
+  try {
+    if (process.env.PAYMENT_WEBHOOK_SECRET) {
+      const supplied = req.headers['x-webhook-secret'];
+      if (supplied !== process.env.PAYMENT_WEBHOOK_SECRET) throw Object.assign(new Error('Invalid webhook secret'), { status: 401 });
+    }
+    const { eventId, providerReference, status } = req.body;
+    if (!providerReference || !status) throw Object.assign(new Error('Invalid payment webhook'), { status: 400 });
+    const allowed = ['AUTHORIZED','CAPTURED','LOCKED','RELEASED','REFUND_PENDING','REFUNDED','FAILED'];
+    if (!allowed.includes(status)) throw Object.assign(new Error('Invalid payment status'), { status: 400 });
+    const payment = await query('SELECT id FROM payment_transactions WHERE provider_reference=$1', [providerReference]);
+    if (!payment.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
+    if (eventId) {
+      const existing = await query('SELECT id FROM payment_events WHERE event_id=$1', [eventId]);
+      if (existing.rows.length) return res.json({ success:true, duplicate:true });
+    }
+    await query('INSERT INTO payment_events(transaction_id,event_id,event_type,payload) VALUES($1,$2,$3,$4)', [
+      payment.rows[0].id, eventId || null, `payment.${status.toLowerCase()}`, JSON.stringify(req.body)
+    ]);
+    await query('UPDATE payment_transactions SET status=$1,provider_payload=provider_payload||$2,updated_at=NOW() WHERE id=$3', [
+      status, JSON.stringify(req.body), payment.rows[0].id
+    ]);
+    res.json({ success:true });
   } catch (err) { next(err); }
 });
 
@@ -774,14 +917,21 @@ router.patch('/dispatches/:id/status', verifyToken, requireRole('LOGISTICS','FAR
     const existing = await query('SELECT * FROM escrow_dispatches WHERE id=$1', [req.params.id]);
     if (!existing.rows.length) throw Object.assign(new Error('Dispatch not found'), { status: 404 });
     const current = existing.rows[0];
+    if (req.user.role === 'LOGISTICS') {
+      // Assignment will be enforced when logistics users and dispatch assignments are introduced.
+    } else if (req.user.role === 'FARMER' && current.farmer_id !== req.user.id) {
+      throw Object.assign(new Error('Forbidden'), { status: 403 });
+    } else if (req.user.role === 'BUYER' && current.buyer_id !== req.user.id) {
+      throw Object.assign(new Error('Forbidden'), { status: 403 });
+    }
     if (req.body.logisticsStatus !== 'DELIVERED' && req.body.logisticsStatus !== 'IN_TRANSIT') {
       throw Object.assign(new Error('Invalid logistics status'), { status: 400 });
     }
     if (transitions[current.logistics_status] !== req.body.logisticsStatus) throw Object.assign(new Error('Invalid status transition'), { status: 409 });
     const delivered = req.body.logisticsStatus === 'DELIVERED';
     const result = await query(`UPDATE escrow_dispatches SET logistics_status=$1,vehicle_number=COALESCE($2,vehicle_number),
-      current_lat=COALESCE($3,current_lat),current_lng=COALESCE($4,current_lng),escrow_status=$5,updated_at=NOW() WHERE id=$6 RETURNING *`,
-      [req.body.logisticsStatus, req.body.vehicleNumber, req.body.currentLat, req.body.currentLng, delivered ? 'RELEASED' : 'LOCKED', req.params.id]);
+      current_lat=COALESCE($3,current_lat),current_lng=COALESCE($4,current_lng),updated_at=NOW() WHERE id=$5 RETURNING *`,
+      [req.body.logisticsStatus, req.body.vehicleNumber, req.body.currentLat, req.body.currentLng, req.params.id]);
     res.json({ dispatch: result.rows[0] });
   } catch (err) { next(err); }
 });

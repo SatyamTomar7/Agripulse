@@ -157,6 +157,32 @@ CREATE TABLE IF NOT EXISTS escrow_dispatches (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS payment_transactions (
+  id SERIAL PRIMARY KEY,
+  auction_id INTEGER UNIQUE NOT NULL REFERENCES auctions(id),
+  buyer_id INTEGER NOT NULL REFERENCES users(id),
+  provider VARCHAR(30) NOT NULL DEFAULT 'MANUAL',
+  provider_reference VARCHAR(120) UNIQUE,
+  amount_inr NUMERIC(12,2) NOT NULL,
+  commission_inr NUMERIC(12,2) DEFAULT 0,
+  payable_to_farmer_inr NUMERIC(12,2) DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'PENDING'
+    CHECK (status IN ('PENDING','AUTHORIZED','CAPTURED','LOCKED','RELEASED','REFUND_PENDING','REFUNDED','FAILED')),
+  invoice_no VARCHAR(50) UNIQUE,
+  provider_payload JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payment_events (
+  id SERIAL PRIMARY KEY,
+  transaction_id INTEGER NOT NULL REFERENCES payment_transactions(id) ON DELETE CASCADE,
+  event_id VARCHAR(120) UNIQUE,
+  event_type VARCHAR(50) NOT NULL,
+  payload JSONB DEFAULT '{}'::jsonb,
+  received_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_lots_status ON crop_lots(status);
 CREATE INDEX IF NOT EXISTS idx_lots_district ON crop_lots(district_id);
 CREATE INDEX IF NOT EXISTS idx_lots_farmer ON crop_lots(farmer_id);
