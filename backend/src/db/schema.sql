@@ -1,0 +1,101 @@
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  full_name VARCHAR(120) NOT NULL,
+  phone VARCHAR(15) UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role VARCHAR(20) CHECK (role IN ('FARMER', 'FPO_ADMIN', 'BUYER', 'LOGISTICS')) NOT NULL,
+  district_id VARCHAR(50) NOT NULL,
+  preferred_lang VARCHAR(10) DEFAULT 'en',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS mandi_prices (
+  id SERIAL PRIMARY KEY,
+  district_id VARCHAR(50) NOT NULL,
+  crop_code VARCHAR(30) NOT NULL,
+  modal_price_inr NUMERIC(10,2) NOT NULL,
+  msp_inr NUMERIC(10,2) NOT NULL,
+  arrival_quintals NUMERIC(10,2) DEFAULT 0,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(district_id, crop_code)
+);
+
+CREATE TABLE IF NOT EXISTS crop_lots (
+  id SERIAL PRIMARY KEY,
+  lot_code VARCHAR(24) UNIQUE NOT NULL,
+  client_event_id UUID UNIQUE NOT NULL,
+  farmer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  fpo_batch_id INTEGER NULL,
+  crop_code VARCHAR(30) NOT NULL,
+  quantity_quintals NUMERIC(10,2) CHECK (quantity_quintals > 0 AND quantity_quintals <= 2000) NOT NULL,
+  moisture_pct NUMERIC(5,2) CHECK (moisture_pct >= 0 AND moisture_pct <= 45) NOT NULL,
+  grade CHAR(1) CHECK (grade IN ('A', 'B', 'C')) NOT NULL,
+  district_id VARCHAR(50) NOT NULL,
+  recommended_floor_inr NUMERIC(10,2) NOT NULL,
+  quality_card JSONB DEFAULT '{}'::jsonb,
+  status VARCHAR(25) DEFAULT 'LISTED' CHECK (status IN ('LISTED', 'POOLED', 'IN_AUCTION', 'SOLD', 'DISPATCHED', 'DELIVERED')),
+  captured_at TIMESTAMPTZ NOT NULL,
+  synced_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS auctions (
+  id SERIAL PRIMARY KEY,
+  lot_id INTEGER UNIQUE REFERENCES crop_lots(id) ON DELETE CASCADE,
+  floor_price_inr NUMERIC(10,2) NOT NULL,
+  current_highest_bid_inr NUMERIC(10,2) NOT NULL,
+  min_increment_inr NUMERIC(10,2) DEFAULT 25.00,
+  highest_bidder_id INTEGER REFERENCES users(id) NULL,
+  status VARCHAR(20) DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED', 'SETTLED')),
+  ends_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bids (
+  id SERIAL PRIMARY KEY,
+  auction_id INTEGER REFERENCES auctions(id) ON DELETE CASCADE,
+  bidder_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  bid_amount_inr NUMERIC(10,2) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS escrow_dispatches (
+  id SERIAL PRIMARY KEY,
+  auction_id INTEGER UNIQUE REFERENCES auctions(id),
+  buyer_id INTEGER REFERENCES users(id),
+  farmer_id INTEGER REFERENCES users(id),
+  total_amount_inr NUMERIC(12,2) NOT NULL,
+  escrow_status VARCHAR(20) DEFAULT 'LOCKED' CHECK (escrow_status IN ('LOCKED', 'RELEASED', 'REFUNDED')),
+  logistics_status VARCHAR(25) DEFAULT 'PENDING_PICKUP' CHECK (logistics_status IN ('PENDING_PICKUP', 'IN_TRANSIT', 'DELIVERED')),
+  vehicle_number VARCHAR(25) NULL,
+  current_lat DOUBLE PRECISION DEFAULT 26.2183,
+  current_lng DOUBLE PRECISION DEFAULT 78.1828,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lots_status ON crop_lots(status);
+CREATE INDEX IF NOT EXISTS idx_lots_district ON crop_lots(district_id);
+CREATE INDEX IF NOT EXISTS idx_lots_farmer ON crop_lots(farmer_id);
+CREATE INDEX IF NOT EXISTS idx_mandi_lookup ON mandi_prices(district_id, crop_code);
+CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status);
+CREATE INDEX IF NOT EXISTS idx_bids_auction ON bids(auction_id);
+
+INSERT INTO users (full_name, phone, password_hash, role, district_id) VALUES
+  ('Ramesh Singh', '9876543210', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'FARMER', 'GWALIOR'),
+  ('Chambal FPO Manager', '9876543211', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'FPO_ADMIN', 'GWALIOR'),
+  ('ITC Agri Procurement', '9876543212', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'BUYER', 'INDORE'),
+  ('MP ColdChain Fleet', '9876543213', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'LOGISTICS', 'GWALIOR')
+ON CONFLICT (phone) DO UPDATE SET password_hash=EXCLUDED.password_hash;
+
+INSERT INTO mandi_prices (district_id, crop_code, modal_price_inr, msp_inr, arrival_quintals) VALUES
+  ('GWALIOR','WHEAT',2520,2425,1200),('GWALIOR','PADDY_COMMON',2440,2369,850),
+  ('GWALIOR','SOYBEAN',5100,4892,640),('GWALIOR','MUSTARD',6120,5950,420),
+  ('GWALIOR','CHICKPEA',5800,5650,310),
+  ('INDORE','WHEAT',2580,2425,1500),('INDORE','PADDY_COMMON',2490,2369,720),
+  ('INDORE','SOYBEAN',5250,4892,980),('INDORE','MUSTARD',6080,5950,390),
+  ('INDORE','CHICKPEA',5900,5650,460),
+  ('BHOPAL','WHEAT',2550,2425,1350),('BHOPAL','PADDY_COMMON',2475,2369,790),
+  ('BHOPAL','SOYBEAN',5180,4892,870),('BHOPAL','MUSTARD',6150,5950,350),
+  ('BHOPAL','CHICKPEA',5850,5650,410),
+  ('JABALPUR','WHEAT',2500,2425,1100),('JABALPUR','PADDY_COMMON',2510,2369,930),
+  ('JABALPUR','SOYBEAN',5060,4892,560),('JABALPUR','MUSTARD',6000,5950,300),
+  ('JABALPUR','CHICKPEA',5780,5650,290)
+ON CONFLICT (district_id, crop_code) DO UPDATE SET modal_price_inr=EXCLUDED.modal_price_inr, msp_inr=EXCLUDED.msp_inr, arrival_quintals=EXCLUDED.arrival_quintals;
