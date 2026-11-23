@@ -76,6 +76,22 @@ CREATE TABLE IF NOT EXISTS crop_lots (
   synced_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS quality_assessments (
+  id SERIAL PRIMARY KEY,
+  lot_id INTEGER NOT NULL REFERENCES crop_lots(id) ON DELETE CASCADE,
+  assessor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  moisture_pct NUMERIC(5,2) CHECK (moisture_pct >= 0 AND moisture_pct <= 45) NOT NULL,
+  grade CHAR(1) CHECK (grade IN ('A', 'B', 'C')) NOT NULL,
+  foreign_matter_pct NUMERIC(5,2) CHECK (foreign_matter_pct >= 0 AND foreign_matter_pct <= 100) NOT NULL,
+  broken_grain_pct NUMERIC(5,2) CHECK (broken_grain_pct >= 0 AND broken_grain_pct <= 100) NOT NULL,
+  certificate_no VARCHAR(80),
+  notes TEXT,
+  status VARCHAR(20) DEFAULT 'SUBMITTED' CHECK (status IN ('SUBMITTED', 'VERIFIED', 'REJECTED')),
+  assessed_at TIMESTAMPTZ DEFAULT NOW(),
+  verified_at TIMESTAMPTZ,
+  UNIQUE(lot_id)
+);
+
 CREATE TABLE IF NOT EXISTS auctions (
   id SERIAL PRIMARY KEY,
   lot_id INTEGER UNIQUE REFERENCES crop_lots(id) ON DELETE CASCADE,

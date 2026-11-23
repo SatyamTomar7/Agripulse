@@ -148,6 +148,24 @@ export default function FarmerDashboard({ user, onPendingChange }) {
     await onPendingChange?.();
   };
 
+  const submitQuality = async lot => {
+    try {
+      const token = localStorage.getItem('agripulse_token');
+      await axios.post(`${API}/api/v1/lots/${lot.id}/quality`, {
+        moisturePct: lot.moisture_pct,
+        grade: lot.grade,
+        foreignMatterPct: Number(foreignMatter),
+        brokenGrainPct: Number(brokenGrain),
+        certificateNo: `Q-${lot.lot_code}`,
+        notes: 'Submitted from farmer mobile quality form'
+      }, { headers:{ Authorization:`Bearer ${token}` } });
+      setMessage(`Quality assessment submitted for ${lot.lot_code}`);
+      await refresh();
+    } catch (error) {
+      setMessage(error.response?.data?.message || 'Quality submission failed');
+    }
+  };
+
   return (
     <div className="grid gap-6 lg:grid-cols-3">
       <section className="rounded-xl border bg-white p-5 shadow-sm">
@@ -180,7 +198,7 @@ export default function FarmerDashboard({ user, onPendingChange }) {
       </section>
       <section className="lg:col-span-3 rounded-xl border bg-white p-5 shadow-sm">
         <div className="flex items-center justify-between"><h2 className="text-xl font-black">My Lots & Sync Queue</h2><button onClick={exportCsv} className="rounded-lg border px-3 py-2 text-sm font-bold">CSV Export</button></div>
-        <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b text-slate-500"><th className="py-2">Lot</th><th>Crop</th><th>Quantity</th><th>Status</th></tr></thead><tbody>{lots.map(l=><tr key={l.id} className="border-b"><td className="py-3">{l.lot_code}</td><td>{l.crop_code}</td><td>{l.quantity_quintals} q</td><td><span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-bold">{l.status}</span></td></tr>)}</tbody></table></div>
+        <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b text-slate-500"><th className="py-2">Lot</th><th>Crop</th><th>Quantity</th><th>Status</th><th>Quality</th></tr></thead><tbody>{lots.map(l=><tr key={l.id} className="border-b"><td className="py-3">{l.lot_code}</td><td>{l.crop_code}</td><td>{l.quantity_quintals} q</td><td><span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-bold">{l.status}</span></td><td>{l.quality_card?.assessmentStatus === 'VERIFIED' ? <span className="font-bold text-emerald-700">Verified</span> : <button onClick={()=>submitQuality(l)} className="rounded border border-emerald-700 px-2 py-1 text-xs font-bold text-emerald-800">Submit Quality</button>}</td></tr>)}</tbody></table></div>
       </section>
     </div>
   );

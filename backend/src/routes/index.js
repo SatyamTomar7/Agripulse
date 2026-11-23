@@ -302,7 +302,7 @@ router.post('/lots/sync', verifyToken, requireRole('FARMER','FPO_ADMIN'), async 
            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
            ON CONFLICT(client_event_id) DO NOTHING RETURNING *`,
           [lotCode, lot.clientEventId, req.user.id, lot.cropCode, lot.quantityQuintals, lot.moisturePct, lot.grade, lot.districtId,
-           floor.recommendedFloorInr, JSON.stringify(lot.qualityCard || {}), lot.capturedAt]
+           floor.recommendedFloorInr, JSON.stringify({ ...(lot.qualityCard || {}), assessmentStatus:'SUBMITTED' }), lot.capturedAt]
         );
         if (!insert.rows.length) continue;
         const created = insert.rows[0];
@@ -354,6 +354,56 @@ router.get('/lots', optionalAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+router.post('/lots/:lotId/quality', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
+  const lotId = Number(req.params.lotId);
+  if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status: 400 });
+  const lot = await query('SELECT * FROM crop_lots WHERE id=$1', [lotId]);
+  if (!lot.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
+  if (req.user.role === 'FARMER' && lot.rows[0].farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+  const { moisturePct, grade, foreignMatterPct, brokenGrainPct, certificateNo, notes } = req.body;
+  validatePrice(lot.rows[0].crop_code, grade, moisturePct);
+  for (const value of [foreignMatterPct, brokenGrainPct]) {
+    if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) throw Object.assign(new Error('Quality percentages must be between 0 and 100'), { status: 400 });
+  }
+  const result = await query(
+    `INSERT INTO quality_assessments(lot_id,assessor_id,moisture_pct,grade,foreign_matter_pct,broken_grain_pct,certificate_no,notes,status)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,'SUBMITTED')
+     ON CONFLICT(lot_id) DO UPDATE SET assessor_id=EXCLUDED.assessor_id,moisture_pct=EXCLUDED.moisture_pct,
+       grade=EXCLUDED.grade,foreign_matter_pct=EXCLUDED.foreign_matter_pct,broken_grain_pct=EXCLUDED.broken_grain_pct,
+       certificate_no=EXCLUDED.certificate_no,notes=EXCLUDED.notes,status='SUBMITTED',assessed_at=NOW(),verified_at=NULL
+     RETURNING *`,
+    [lotId, req.user.id, moisturePct, grade, foreignMatterPct, brokenGrainPct, certificateNo?.trim() || null, notes?.trim() || null]
+  );
+  await query(
+    `UPDATE crop_lots SET quality_card=COALESCE(quality_card,'{}'::jsonb)||jsonb_build_object(
+       'assessmentStatus','SUBMITTED','moisturePct',$1,'grade',$2,'foreignMatterPct',$3,'brokenGrainPct',$4)
+     WHERE id=$5`,
+    [moisturePct, grade, foreignMatterPct, brokenGrainPct, lotId]
+  );
+  res.status(201).json({ assessment: result.rows[0] });
+});
+
+router.patch('/lots/:lotId/quality/:status', verifyToken, requireRole('FPO_ADMIN'), async (req, res, next) => {
+  const lotId = Number(req.params.lotId);
+  const status = req.params.status.toUpperCase();
+  if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status: 400 });
+  if (!['VERIFIED','REJECTED'].includes(status)) throw Object.assign(new Error('Invalid verification status'), { status: 400 });
+  const assessment = await query('SELECT * FROM quality_assessments WHERE lot_id=$1', [lotId]);
+  if (!assessment.rows.length) throw Object.assign(new Error('Quality assessment not found'), { status: 404 });
+  const result = await query(
+    `UPDATE quality_assessments SET status=$1,verified_at=NOW(),assessor_id=COALESCE(assessor_id,$3) WHERE lot_id=$2 RETURNING *`,
+    [status, lotId, req.user.id]
+  );
+  await query(
+    `UPDATE crop_lots SET quality_card=COALESCE(quality_card,'{}'::jsonb)||jsonb_build_object('assessmentStatus',$1),
+     moisture_pct=CASE WHEN $1='VERIFIED' THEN (SELECT moisture_pct FROM quality_assessments WHERE lot_id=$2) ELSE moisture_pct END,
+     grade=CASE WHEN $1='VERIFIED' THEN (SELECT grade FROM quality_assessments WHERE lot_id=$2) ELSE grade END
+     WHERE id=$2`,
+    [status, lotId]
+  );
+  res.json({ assessment: result.rows[0] });
+});
+
 router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res, next) => {
   const client = await pool.connect();
   try {
@@ -362,6 +412,8 @@ router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res
     if (!Array.isArray(lotIds) || !lotIds.length) throw Object.assign(new Error('lotIds is required'), { status: 400 });
     const lots = await client.query('SELECT * FROM crop_lots WHERE id=ANY($1::int[]) FOR UPDATE', [lotIds]);
     const first = lots.rows[0];
+    if (lots.rows.some(lot => lot.status !== 'LISTED')) throw Object.assign(new Error('Only listed lots can be pooled'), { status: 409, code: 'LOT_NOT_LISTED' });
+    if (lots.rows.some(lot => lot.quality_card?.assessmentStatus !== 'VERIFIED')) throw Object.assign(new Error('All lots must have verified quality assessments'), { status: 409, code: 'QUALITY_NOT_VERIFIED' });
     if (!first || new Set(lots.rows.map(l => l.crop_code)).size !== 1 || new Set(lots.rows.map(l => l.grade)).size !== 1) {
       throw Object.assign(new Error('Lots must have the same crop and grade'), { status: 400, code: 'POOL_MISMATCH' });
     }

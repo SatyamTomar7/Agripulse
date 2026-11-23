@@ -25,13 +25,30 @@ export default function FpoPoolDashboard() {
       setSelected([]); await load();
     } catch (err) { setMessage(err.response?.data?.message || 'Pooling failed'); }
   };
+  const verifyQuality = async (lot, status) => {
+    try {
+      await axios.patch(`${API}/api/v1/lots/${lot.id}/quality/${status}`, {}, { headers });
+      setMessage(status === 'VERIFIED' ? `Quality verified for ${lot.lot_code}` : `Quality rejected for ${lot.lot_code}`);
+      await load();
+    } catch (err) { setMessage(err.response?.data?.message || 'Quality update failed'); }
+  };
   return (
     <section>
       <div className="mb-5 flex items-end justify-between"><div><p className="text-sm font-bold text-emerald-700">FPO Aggregation</p><h1 className="text-3xl font-black">Bulk Truckload Pool</h1></div><button disabled={!selected.length} onClick={pool} className="rounded-lg bg-emerald-700 px-5 py-3 font-bold text-white disabled:opacity-40">Pool Selected Lots</button></div>
       {message && <p className="mb-4 rounded-lg bg-emerald-50 p-3 text-sm font-semibold text-emerald-800">{message}</p>}
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">{lots.map(l=>{
         const allowed = !compatible || (compatible.crop_code===l.crop_code && compatible.grade===l.grade);
-        return <label key={l.id} className={`rounded-xl border bg-white p-4 shadow-sm ${selected.includes(l.id)?'ring-2 ring-emerald-600':''}`}><input type="checkbox" checked={selected.includes(l.id)} disabled={!allowed} onChange={()=>toggle(l.id)} className="mr-3"/><b>{l.lot_code}</b><p className="mt-2 text-sm text-slate-600">{l.crop_code} · Grade {l.grade} · {l.quantity_quintals} quintals</p><p className="mt-1 text-xs text-slate-500">{l.district_id} · Floor ₹{l.recommended_floor_inr}</p></label>;
+        const qualityStatus = l.quality_card?.assessmentStatus || 'SUBMITTED';
+        return <article key={l.id} className={`rounded-xl border bg-white p-4 shadow-sm ${selected.includes(l.id)?'ring-2 ring-emerald-600':''}`}>
+          <label><input type="checkbox" checked={selected.includes(l.id)} disabled={!allowed || qualityStatus !== 'VERIFIED'} onChange={()=>toggle(l.id)} className="mr-3"/><b>{l.lot_code}</b></label>
+          <p className="mt-2 text-sm text-slate-600">{l.crop_code} · Grade {l.grade} · {l.quantity_quintals} quintals</p>
+          <p className="mt-1 text-xs text-slate-500">{l.district_id} · Floor ₹{l.recommended_floor_inr}</p>
+          <p className="mt-2 text-xs font-bold">Quality: {qualityStatus}</p>
+          {qualityStatus !== 'VERIFIED' && <div className="mt-3 flex gap-2">
+            <button onClick={()=>verifyQuality(l,'VERIFIED')} className="rounded bg-emerald-700 px-3 py-1 text-xs font-bold text-white">Verify</button>
+            <button onClick={()=>verifyQuality(l,'REJECTED')} className="rounded border border-red-400 px-3 py-1 text-xs font-bold text-red-700">Reject</button>
+          </div>}
+        </article>;
       })}</div>
     </section>
   );
