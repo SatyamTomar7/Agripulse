@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS mandi_prices (
   UNIQUE(district_id, crop_code)
 );
 
+CREATE TABLE IF NOT EXISTS mandi_price_history (
+  id SERIAL PRIMARY KEY,
+  district_id VARCHAR(50) NOT NULL,
+  crop_code VARCHAR(30) NOT NULL,
+  modal_price_inr NUMERIC(10,2) NOT NULL,
+  msp_inr NUMERIC(10,2) NOT NULL,
+  arrival_quintals NUMERIC(10,2) DEFAULT 0,
+  source VARCHAR(120) DEFAULT 'ADMIN',
+  changed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  effective_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS crop_lots (
   id SERIAL PRIMARY KEY,
   lot_code VARCHAR(24) UNIQUE NOT NULL,

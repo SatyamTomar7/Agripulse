@@ -256,10 +256,75 @@ router.get('/advisory/fair-price', async (req, res, next) => {
   try {
     const { cropCode, districtId, grade, moisturePct } = req.query;
     validatePrice(cropCode, grade, moisturePct);
+    if (!districtId) throw Object.assign(new Error('districtId is required'), { status: 400 });
+    const district = await query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [districtId]);
+    if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400, code: 'INVALID_DISTRICT' });
     const price = await priceCache.getPrice(districtId, cropCode);
-    const calculated = calculateFloor({ cropCode, mandiModalInr: price.mandiModalInr, grade, moisturePct });
+    const calculated = calculateFloor({ cropCode, mandiModalInr: price.mandiModalInr, mspInr: price.mspInr, grade, moisturePct });
     res.json({ cropCode, districtId, mandiModalInr: price.mandiModalInr, mspInr: calculated.mspInr,
-      moisturePenaltyInr: calculated.moisturePenaltyInr, recommendedFloorInr: calculated.recommendedFloorInr });
+      moisturePenaltyInr: calculated.moisturePenaltyInr, recommendedFloorInr: calculated.recommendedFloorInr,
+      arrivalQuintals: price.arrivalQuintals, priceUpdatedAt: price.updatedAt, source: price.source });
+  } catch (err) { next(err); }
+});
+
+router.get('/advisory/nearby-prices', async (req, res, next) => {
+  try {
+    const { cropCode, districtId } = req.query;
+    validatePrice(cropCode, 'A', 11);
+    if (!districtId) throw Object.assign(new Error('districtId is required'), { status: 400 });
+    const result = await query(
+      `SELECT district_id,modal_price_inr,msp_inr,arrival_quintals,updated_at
+       FROM mandi_prices WHERE crop_code=$1 ORDER BY ABS(arrival_quintals) DESC,updated_at DESC`,
+      [cropCode]
+    );
+    res.json({
+      cropCode,
+      requestedDistrictId: districtId,
+      prices: result.rows.map(row => ({
+        districtId: row.district_id,
+        mandiModalInr: Number(row.modal_price_inr),
+        mspInr: Number(row.msp_inr),
+        arrivalQuintals: Number(row.arrival_quintals),
+        updatedAt: row.updated_at,
+        source: 'AGMARKNET/Mandi data'
+      }))
+    });
+  } catch (err) { next(err); }
+});
+
+router.put('/admin/mandi-prices/:districtId/:cropCode', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    const { districtId, cropCode } = req.params;
+    const { modalPriceInr, mspInr, arrivalQuintals, source } = req.body;
+    const values = [modalPriceInr, mspInr, arrivalQuintals];
+    if (values.some(value => !Number.isFinite(Number(value)) || Number(value) < 0)) throw Object.assign(new Error('Invalid mandi price values'), { status: 400 });
+    validatePrice(cropCode, 'A', 11);
+    const district = await query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [districtId]);
+    if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400, code: 'INVALID_DISTRICT' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO mandi_prices(district_id,crop_code,modal_price_inr,msp_inr,arrival_quintals,updated_at)
+         VALUES($1,$2,$3,$4,$5,NOW())
+         ON CONFLICT(district_id,crop_code) DO UPDATE SET modal_price_inr=EXCLUDED.modal_price_inr,
+         msp_inr=EXCLUDED.msp_inr,arrival_quintals=EXCLUDED.arrival_quintals,updated_at=NOW()`,
+        [districtId, cropCode, modalPriceInr, mspInr, arrivalQuintals || 0]
+      );
+      await client.query(
+        `INSERT INTO mandi_price_history(district_id,crop_code,modal_price_inr,msp_inr,arrival_quintals,source,changed_by,effective_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
+        [districtId, cropCode, modalPriceInr, mspInr, arrivalQuintals || 0, source?.trim() || 'ADMIN', req.user.id]
+      );
+      await client.query('COMMIT');
+      priceCache._cache.clear();
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+    res.json({ success:true, districtId, cropCode, modalPriceInr:Number(modalPriceInr), mspInr:Number(mspInr), arrivalQuintals:Number(arrivalQuintals || 0) });
   } catch (err) { next(err); }
 });
 

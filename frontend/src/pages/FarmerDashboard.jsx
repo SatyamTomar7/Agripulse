@@ -22,6 +22,7 @@ export default function FarmerDashboard({ user, onPendingChange }) {
   const [capturedPhoto, setCapturedPhoto] = useState('');
   const [latitude, setLatitude] = useState(null);
   const [longitude, setLongitude] = useState(null);
+  const [nearbyPrices, setNearbyPrices] = useState([]);
   const [crops, setCrops] = useState([
     { code:'WHEAT', name:'Wheat' },{ code:'PADDY_COMMON', name:'Paddy (Common)' },
     { code:'SOYBEAN', name:'Soybean' },{ code:'MUSTARD', name:'Mustard' },{ code:'CHICKPEA', name:'Chickpea' }
@@ -63,13 +64,29 @@ export default function FarmerDashboard({ user, onPendingChange }) {
   const [calculated, setCalculated] = useState(null);
   useEffect(() => {
     (async () => {
-      let modal = modalFallback[crop];
-      const cached = await db.mandiCache.get({ districtId:district,cropCode:crop });
-      if (cached) modal = cached.modalPriceInr;
-      const base = Math.max(modal, msp[crop]) * ({A:1.06,B:1,C:.92}[grade]);
-      const penalty = Number((base * (Math.max(0,Number(moisture)-12)*.015)).toFixed(2));
-      const floorPrice = Math.max(Number((base-penalty).toFixed(2)), Number((msp[crop]*.95).toFixed(2)));
-      setCalculated({ modal, penalty, floorPrice, msp:msp[crop] });
+      try {
+        const [fairPrice, nearby] = await Promise.all([
+          axios.get(`${API}/api/v1/advisory/fair-price`, { params:{ cropCode:crop,districtId:district,grade,moisturePct:moisture } }),
+          axios.get(`${API}/api/v1/advisory/nearby-prices`, { params:{ cropCode:crop,districtId:district } })
+        ]);
+        setCalculated({
+          modal:fairPrice.data.mandiModalInr,
+          penalty:fairPrice.data.moisturePenaltyInr,
+          floorPrice:fairPrice.data.recommendedFloorInr,
+          msp:fairPrice.data.mspInr,
+          updatedAt:fairPrice.data.priceUpdatedAt,
+          source:fairPrice.data.source
+        });
+        setNearbyPrices(nearby.data.prices);
+      } catch {
+        let modal = modalFallback[crop];
+        const cached = await db.mandiCache.get({ districtId:district,cropCode:crop });
+        if (cached) modal = cached.modalPriceInr;
+        const base = Math.max(modal, msp[crop]) * ({A:1.06,B:1,C:.92}[grade]);
+        const penalty = Number((base * (Math.max(0,Number(moisture)-12)*.015)).toFixed(2));
+        const floorPrice = Math.max(Number((base-penalty).toFixed(2)), Number((msp[crop]*.95).toFixed(2)));
+        setCalculated({ modal, penalty, floorPrice, msp:msp[crop], source:'Offline cached estimate' });
+      }
     })();
   }, [crop,district,grade,moisture]);
 
@@ -176,7 +193,16 @@ export default function FarmerDashboard({ user, onPendingChange }) {
           <label className="text-sm font-semibold">Grade<select value={grade} onChange={e=>setGrade(e.target.value)} className="mt-1 w-full rounded border p-2"><option>A</option><option>B</option><option>C</option></select></label>
           <label className="text-sm font-semibold">Moisture %<input type="number" min="0" max="45" value={moisture} onChange={e=>setMoisture(e.target.value)} className="mt-1 w-full rounded border p-2"/></label>
         </div>
-        {calculated && <div className="mt-5 rounded-xl bg-emerald-50 p-4"><p className="text-sm text-slate-600">Recommended floor</p><p className="text-3xl font-black text-emerald-800">₹{calculated.floorPrice.toFixed(2)}</p><p className="mt-2 text-xs text-slate-600">MSP ₹{calculated.msp} · Moisture penalty ₹{calculated.penalty}</p></div>}
+        {calculated && <div className="mt-5 rounded-xl bg-emerald-50 p-4">
+          <p className="text-sm text-slate-600">Recommended floor</p>
+          <p className="text-3xl font-black text-emerald-800">₹{calculated.floorPrice.toFixed(2)}</p>
+          <p className="mt-2 text-xs text-slate-600">Mandi ₹{calculated.modal} · MSP ₹{calculated.msp} · Moisture penalty ₹{calculated.penalty}</p>
+          <p className="mt-1 text-[11px] text-slate-500">{calculated.source}{calculated.updatedAt ? ` · ${new Date(calculated.updatedAt).toLocaleString()}` : ''}</p>
+        </div>}
+        {nearbyPrices.length > 0 && <div className="mt-4 rounded-lg border p-3">
+          <p className="text-sm font-black">Nearby mandi prices</p>
+          <div className="mt-2 space-y-1">{nearbyPrices.map(price => <div key={price.districtId} className="flex justify-between text-xs"><span>{price.districtId}</span><b>₹{price.mandiModalInr}</b></div>)}</div>
+        </div>}
       </section>
       <section className="rounded-xl border bg-white p-5 shadow-sm">
         <h2 className="text-xl font-black">Register Harvest Lot</h2>

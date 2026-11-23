@@ -17,9 +17,9 @@ function validate(cropCode, grade, moisturePct) {
   return moisture;
 }
 
-function calculateFloor({ cropCode, mandiModalInr, grade, moisturePct }) {
+function calculateFloor({ cropCode, mandiModalInr, mspInr, grade, moisturePct }) {
   const moisture = validate(cropCode, grade, moisturePct);
-  const msp = MSP[cropCode];
+  const msp = Number.isFinite(Number(mspInr)) ? Number(mspInr) : MSP[cropCode];
   const basePrice = Math.max(Number(mandiModalInr), msp) * GRADE_MULTIPLIERS[grade];
   const excessMoisture = Math.max(0, moisture - 12);
   const moisturePenaltyInr = Number((basePrice * (excessMoisture * 0.015)).toFixed(2));
