@@ -178,6 +178,32 @@ CREATE TABLE IF NOT EXISTS dispatch_status_history (
   changed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS notification_preferences (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  in_app BOOLEAN DEFAULT TRUE,
+  sms BOOLEAN DEFAULT FALSE,
+  email BOOLEAN DEFAULT FALSE,
+  push BOOLEAN DEFAULT FALSE,
+  quiet_start TIME,
+  quiet_end TIME
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  channel VARCHAR(20) CHECK (channel IN ('IN_APP','SMS','EMAIL','PUSH')) NOT NULL,
+  event_type VARCHAR(50) NOT NULL,
+  title VARCHAR(160) NOT NULL,
+  body TEXT NOT NULL,
+  data JSONB DEFAULT '{}'::jsonb,
+  status VARCHAR(20) DEFAULT 'PENDING' CHECK (status IN ('PENDING','SENT','FAILED','READ')),
+  attempts INTEGER DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ DEFAULT NOW(),
+  sent_at TIMESTAMPTZ,
+  read_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS payment_transactions (
   id SERIAL PRIMARY KEY,
   auction_id INTEGER UNIQUE NOT NULL REFERENCES auctions(id),

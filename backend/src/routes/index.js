@@ -55,6 +55,42 @@ const optionalAuth = (req, res, next) => {
   return verifyToken(req, res, next);
 };
 
+const notify = async (userId, eventType, englishTitle, englishBody, data = {}) => {
+  const userResult = await query(
+    `SELECT u.preferred_lang,p.in_app,p.sms,p.email,p.push
+     FROM users u LEFT JOIN notification_preferences p ON p.user_id=u.id
+     WHERE u.id=$1`,
+    [userId]
+  );
+  if (!userResult.rows.length) return;
+  const user = userResult.rows[0];
+  const hindi = user.preferred_lang === 'hi';
+  const title = hindi ? englishTitle.hi : englishTitle.en;
+  const body = hindi ? englishBody.hi : englishBody.en;
+  if (user.in_app !== false) {
+    await query(
+      `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
+       VALUES($1,'IN_APP',$2,$3,$4,$5,'PENDING')`,
+      [userId,eventType,title,body,JSON.stringify(data)]
+    );
+  }
+  if (user.sms) await query(
+    `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
+     VALUES($1,'SMS',$2,$3,$4,$5,'PENDING')`,
+    [userId,eventType,title,body,JSON.stringify(data)]
+  );
+  if (user.email) await query(
+    `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
+     VALUES($1,'EMAIL',$2,$3,$4,$5,'PENDING')`,
+    [userId,eventType,title,body,JSON.stringify(data)]
+  );
+  if (user.push) await query(
+    `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
+     VALUES($1,'PUSH',$2,$3,$4,$5,'PENDING')`,
+    [userId,eventType,title,body,JSON.stringify(data)]
+  );
+};
+
 router.get('/master-data', async (req, res, next) => {
   try {
     const [districtResult, cropResult] = await Promise.all([
@@ -200,6 +236,70 @@ router.patch('/auth/me', verifyToken, async (req, res, next) => {
        bankAccountLast4 ?? null, kycStatus ?? null, req.user.id]
     );
     res.json({ user: publicUser(result.rows[0]) });
+  } catch (err) { next(err); }
+});
+
+router.get('/notifications/preferences', verifyToken, async (req, res, next) => {
+  try {
+    const result = await query(
+      'SELECT in_app,sms,email,push,quiet_start,quiet_end FROM notification_preferences WHERE user_id=$1',
+      [req.user.id]
+    );
+    res.json({ preferences:result.rows[0] || { in_app:true,sms:false,email:false,push:false } });
+  } catch (err) { next(err); }
+});
+
+router.put('/notifications/preferences', verifyToken, async (req, res, next) => {
+  try {
+    const result = await query(
+      `INSERT INTO notification_preferences(user_id,in_app,sms,email,push,quiet_start,quiet_end)
+       VALUES($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT(user_id) DO UPDATE SET in_app=EXCLUDED.in_app,sms=EXCLUDED.sms,email=EXCLUDED.email,
+       push=EXCLUDED.push,quiet_start=EXCLUDED.quiet_start,quiet_end=EXCLUDED.quiet_end
+       RETURNING in_app,sms,email,push,quiet_start,quiet_end`,
+      [req.user.id,req.body.inApp !== false,req.body.sms === true,req.body.email === true,
+       req.body.push === true,req.body.quietStart || null,req.body.quietEnd || null]
+    );
+    res.json({ preferences:result.rows[0] });
+  } catch (err) { next(err); }
+});
+
+router.get('/notifications', verifyToken, async (req, res, next) => {
+  try {
+    const limit = Math.min(100,Math.max(1,Number(req.query.limit) || 30));
+    const result = await query(
+      `SELECT id,channel,event_type,title,body,data,status,created_at,read_at
+       FROM notifications WHERE user_id=$1 AND channel='IN_APP'
+       ORDER BY created_at DESC LIMIT $2`,
+      [req.user.id,limit]
+    );
+    res.json({ notifications:result.rows, unreadCount:(await query(
+      "SELECT COUNT(*)::int AS count FROM notifications WHERE user_id=$1 AND channel='IN_APP' AND status!='READ'",
+      [req.user.id]
+    )).rows[0].count });
+  } catch (err) { next(err); }
+});
+
+router.post('/notifications/:id/read', verifyToken, async (req, res, next) => {
+  try {
+    const result = await query(
+      `UPDATE notifications SET status='READ',read_at=NOW()
+       WHERE id=$1 AND user_id=$2 AND channel='IN_APP' RETURNING id,status,read_at`,
+      [req.params.id,req.user.id]
+    );
+    if (!result.rows.length) throw Object.assign(new Error('Notification not found'), { status:404 });
+    res.json({ notification:result.rows[0] });
+  } catch (err) { next(err); }
+});
+
+router.post('/notifications/read-all', verifyToken, async (req, res, next) => {
+  try {
+    await query(
+      `UPDATE notifications SET status='READ',read_at=NOW()
+       WHERE user_id=$1 AND channel='IN_APP' AND status!='READ'`,
+      [req.user.id]
+    );
+    res.json({ success:true });
   } catch (err) { next(err); }
 });
 
@@ -563,6 +663,11 @@ router.patch('/lots/:lotId/quality/:status', verifyToken, requireRole('FPO_ADMIN
      WHERE id=$2`,
     [status, lotId]
   );
+  const lotResult = await query('SELECT farmer_id,lot_code FROM crop_lots WHERE id=$1', [lotId]);
+  if (lotResult.rows.length) await notify(lotResult.rows[0].farmer_id,'QUALITY_UPDATE',
+    {en:`Quality ${status.toLowerCase()}`,hi:`गुणवत्ता ${status === 'VERIFIED' ? 'सत्यापित' : 'अस्वीकृत'}`},
+    {en:`Quality assessment for ${lotResult.rows[0].lot_code} is ${status.toLowerCase()}`,hi:`${lotResult.rows[0].lot_code} की गुणवत्ता ${status === 'VERIFIED' ? 'सत्यापित' : 'अस्वीकृत'} है`},
+    {lotId,lotCode:lotResult.rows[0].lot_code,status});
   res.json({ assessment: result.rows[0] });
 });
 
@@ -714,6 +819,12 @@ router.post('/auctions/:auctionId/bids', verifyToken, requireRole('BUYER'), asyn
     await client.query('INSERT INTO bids(auction_id,bidder_id,bid_amount_inr) VALUES($1,$2,$3)', [auction.id, req.user.id, amount]);
     await client.query('COMMIT');
     req.app.get('io')?.emit('bid:updated', { auctionId: auction.id, currentHighestBidInr: amount, highestBidderId: req.user.id });
+    if (auction.highest_bidder_id && auction.highest_bidder_id !== req.user.id) {
+      await notify(auction.highest_bidder_id,'AUCTION_OUTBID',
+        {en:'You have been outbid',hi:'आपकी बोली पार कर दी गई'},
+        {en:`A new bid of ₹${amount} was placed on auction ${auction.id}`,hi:`नीलामी ${auction.id} पर ₹${amount} की नई बोली लगी`},
+        {auctionId:auction.id,amount});
+    }
     res.json({ success: true, auctionId: auction.id, currentHighestBidInr: amount });
   } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
@@ -739,7 +850,7 @@ router.post('/auctions/:auctionId/accept', verifyToken, requireRole('FARMER','FP
     await client.query('BEGIN');
     const auctionId = Number(req.params.auctionId);
     if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
-    const result = await client.query(`SELECT a.*,l.farmer_id,l.fpo_batch_id,l.status AS lot_status FROM auctions a JOIN crop_lots l ON l.id=a.lot_id WHERE a.id=$1 FOR UPDATE`, [auctionId]);
+    const result = await client.query(`SELECT a.*,l.lot_code,l.farmer_id,l.fpo_batch_id,l.status AS lot_status FROM auctions a JOIN crop_lots l ON l.id=a.lot_id WHERE a.id=$1 FOR UPDATE`, [auctionId]);
     if (!result.rows.length) throw Object.assign(new Error('Auction not found'), { status: 404 });
     const auction = result.rows[0];
     if (req.user.role === 'FARMER' && auction.farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
@@ -765,6 +876,14 @@ router.post('/auctions/:auctionId/accept', verifyToken, requireRole('FARMER','FP
     );
     await client.query('COMMIT');
     req.app.get('io')?.emit('auction:closed', { auctionId: auction.id, lotId: auction.lot_id });
+    await notify(auction.highest_bidder_id,'AUCTION_WON',
+      {en:'Auction won',hi:'नीलामी जीती'},
+      {en:`You won ${auction.lot_code} for ₹${auction.current_highest_bid_inr}`,hi:`आपने ₹${auction.current_highest_bid_inr} में ${auction.lot_code} जीता`},
+      {auctionId:auction.id,lotCode:auction.lot_code});
+    await notify(auction.farmer_id,'AUCTION_ACCEPTED',
+      {en:'Winning bid accepted',hi:'विजेता बोली स्वीकार की गई'},
+      {en:`The winning bid for ${auction.lot_code} was accepted`,hi:`${auction.lot_code} की विजेता बोली स्वीकार कर ली गई`},
+      {auctionId:auction.id,lotCode:auction.lot_code});
     res.json({ success: true, auctionId: auction.id, status: 'CLOSED' });
   } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
@@ -984,6 +1103,12 @@ router.patch('/dispatches/:id/status', verifyToken, requireRole('LOGISTICS'), as
       [req.params.id,current.logistics_status,req.body.logisticsStatus,req.user.id,lat,lng,req.body.note?.trim() || null]
     );
     req.app.get('io')?.emit('dispatch:updated', result.rows[0]);
+    for (const partyId of [current.farmer_id,current.buyer_id]) {
+      if (partyId) await notify(partyId,'DISPATCH_UPDATE',
+        {en:'Shipment update',hi:'शिपमेंट अपडेट'},
+        {en:`Dispatch ${req.params.id} is now ${req.body.logisticsStatus}`,hi:`डिस्पैच ${req.params.id} अब ${req.body.logisticsStatus} है`},
+        {dispatchId:Number(req.params.id),status:req.body.logisticsStatus});
+    }
     res.json({ dispatch: result.rows[0] });
   } catch (err) { next(err); }
 });

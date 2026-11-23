@@ -9,6 +9,7 @@ import LogisticsTracker from './pages/LogisticsTracker';
 import { startSyncManager } from './services/syncManager';
 import { db } from './db/offlineDb';
 import AccountSettings from './components/AccountSettings';
+import NotificationCenter from './components/NotificationCenter';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
@@ -91,6 +92,7 @@ export default function App() {
             <p className="text-sm text-slate-600">{user.fullName} · {user.role}</p>
           </div>
           <div className="flex items-center gap-2">
+            <NotificationCenter />
             <AccountSettings user={user} onUpdated={setUser} />
             <button onClick={logout} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700">Logout</button>
           </div>
