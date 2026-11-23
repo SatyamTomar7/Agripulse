@@ -372,9 +372,8 @@ router.post('/lots/sync', verifyToken, requireRole('FARMER','FPO_ADMIN'), async 
         if (!insert.rows.length) continue;
         const created = insert.rows[0];
         await client.query(
-          `INSERT INTO auctions(lot_id,floor_price_inr,current_highest_bid_inr,ends_at)
-           VALUES($1,$2,$2,NOW()+INTERVAL '24 hours')`,
-          [created.id, created.recommended_floor_inr]
+          'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,NULL,$2,$3,$4)',
+          [created.id, created.status, req.user.id, 'Lot registered']
         );
         syncedLots.push(created);
         req.app.get('io')?.emit('lot:created', created);
@@ -398,7 +397,17 @@ router.post('/lots/sync', verifyToken, requireRole('FARMER','FPO_ADMIN'), async 
 
 router.get('/lots/export/csv', verifyToken, async (req, res, next) => {
   try {
-    const result = await query('SELECT lot_code,crop_code,quantity_quintals,moisture_pct,grade,district_id,status,recommended_floor_inr FROM crop_lots ORDER BY id');
+    const conditions = [];
+    const params = [];
+    if (req.user.role === 'FARMER') {
+      params.push(req.user.id);
+      conditions.push(`farmer_id=$${params.length}`);
+    } else if (req.user.role === 'FPO_ADMIN') {
+      params.push(req.user.districtId);
+      conditions.push(`district_id=$${params.length}`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const result = await query(`SELECT lot_code,crop_code,quantity_quintals,moisture_pct,grade,district_id,status,recommended_floor_inr FROM crop_lots ${where} ORDER BY id`, params);
     const header = ['lotCode','cropCode','quantityQuintals','moisturePct','grade','districtId','status','recommendedFloorInr'];
     const rows = result.rows.map(r => [r.lot_code,r.crop_code,r.quantity_quintals,r.moisture_pct,r.grade,r.district_id,r.status,r.recommended_floor_inr]);
     res.setHeader('Content-Type','text/csv; charset=utf-8');
@@ -417,6 +426,94 @@ router.get('/lots', optionalAuth, async (req, res, next) => {
     const result = await query(`SELECT * FROM crop_lots ${where} ORDER BY id DESC`, params);
     res.json({ lots: result.rows });
   } catch (err) { next(err); }
+});
+
+router.get('/lots/:lotId', verifyToken, async (req, res, next) => {
+  try {
+    const lotId = Number(req.params.lotId);
+    if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status: 400 });
+    const result = await query('SELECT * FROM crop_lots WHERE id=$1', [lotId]);
+    if (!result.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
+    const lot = result.rows[0];
+    if (req.user.role === 'FARMER' && lot.farmer_id !== req.user.id) throw Object.assign(new Error('Forbidden'), { status: 403 });
+    if (req.user.role === 'FPO_ADMIN' && lot.farmer_id !== req.user.id && lot.fpo_batch_id === null) throw Object.assign(new Error('Forbidden'), { status: 403 });
+    const history = await query(
+      'SELECT previous_status,new_status,changed_by,reason,changed_at FROM lot_status_history WHERE lot_id=$1 ORDER BY changed_at DESC',
+      [lotId]
+    );
+    res.json({ lot, history: history.rows });
+  } catch (err) { next(err); }
+});
+
+router.patch('/lots/:lotId', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lotId = Number(req.params.lotId);
+    if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status: 400 });
+    const lotResult = await client.query('SELECT * FROM crop_lots WHERE id=$1 FOR UPDATE', [lotId]);
+    if (!lotResult.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
+    const lot = lotResult.rows[0];
+    if (lot.farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+    if (!['DRAFT','LISTED'].includes(lot.status)) throw Object.assign(new Error(`Lot cannot be edited in ${lot.status} status`), { status: 409, code: 'LOT_LOCKED' });
+    const quantity = req.body.quantityQuintals === undefined ? Number(lot.quantity_quintals) : Number(req.body.quantityQuintals);
+    const moisture = req.body.moisturePct === undefined ? Number(lot.moisture_pct) : Number(req.body.moisturePct);
+    const grade = req.body.grade === undefined ? lot.grade : req.body.grade;
+    const cropCode = req.body.cropCode === undefined ? lot.crop_code : req.body.cropCode;
+    validatePrice(cropCode, grade, moisture);
+    if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 2000) throw Object.assign(new Error('Invalid quantity'), { status: 400 });
+    const district = await client.query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [req.body.districtId || lot.district_id]);
+    if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400 });
+    const districtPrice = await priceCache.getPrice(req.body.districtId || lot.district_id, cropCode);
+    const floor = calculateFloor({ cropCode, mandiModalInr:districtPrice.mandiModalInr, mspInr:districtPrice.mspInr, grade, moisturePct:moisture });
+    const updated = await client.query(
+      `UPDATE crop_lots SET crop_code=$1,quantity_quintals=$2,moisture_pct=$3,grade=$4,district_id=$5,recommended_floor_inr=$6
+       WHERE id=$7 RETURNING *`,
+      [cropCode, quantity, moisture, grade, req.body.districtId || lot.district_id, floor.recommendedFloorInr, lotId]
+    );
+    await client.query('COMMIT');
+    res.json({ lot:updated.rows[0] });
+  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
+});
+
+router.post('/lots/:lotId/cancel', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lotId = Number(req.params.lotId);
+    const result = await client.query('SELECT * FROM crop_lots WHERE id=$1 FOR UPDATE', [lotId]);
+    if (!result.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
+    const lot = result.rows[0];
+    if (lot.farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+    if (!['DRAFT','LISTED','POOLED'].includes(lot.status)) throw Object.assign(new Error('Lot cannot be canceled in its current status'), { status: 409 });
+    await client.query('UPDATE crop_lots SET status=\'CANCELED\' WHERE id=$1', [lotId]);
+    await client.query(
+      'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,$2,$3,$4,$5)',
+      [lotId, lot.status, 'CANCELED', req.user.id, req.body.reason?.trim() || 'Canceled by owner']
+    );
+    await client.query('COMMIT');
+    res.json({ success:true, lotId, status:'CANCELED' });
+  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
+});
+
+router.post('/lots/:lotId/relist', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lotId = Number(req.params.lotId);
+    const result = await client.query('SELECT * FROM crop_lots WHERE id=$1 FOR UPDATE', [lotId]);
+    if (!result.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
+    const lot = result.rows[0];
+    if (lot.farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+    if (lot.status !== 'CANCELED') throw Object.assign(new Error('Only canceled lots can be relisted'), { status: 409 });
+    await client.query('UPDATE crop_lots SET status=\'LISTED\' WHERE id=$1', [lotId]);
+    await client.query(
+      'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,$2,$3,$4,$5)',
+      [lotId, lot.status, 'LISTED', req.user.id, 'Relisted by owner']
+    );
+    await client.query('COMMIT');
+    res.json({ success:true, lotId, status:'LISTED' });
+  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
 
 router.post('/lots/:lotId/quality', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
@@ -492,6 +589,15 @@ router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res
       [lotCode, uuidv4(), req.user.id, first.id, first.crop_code, quantity, first.moisture_pct, first.grade, districtId, floor, new Date()]
     );
     await client.query('UPDATE crop_lots SET status=\'POOLED\', fpo_batch_id=$1 WHERE id=ANY($2::int[])', [created.rows[0].id, lotIds]);
+    await client.query(
+      `INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason)
+       SELECT id,'LISTED','POOLED',$1,'Included in FPO pool' FROM crop_lots WHERE id=ANY($2::int[])`,
+      [req.user.id, lotIds]
+    );
+    await client.query(
+      'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,$2,$3,$4,$5)',
+      [created.rows[0].id, 'LISTED', 'IN_AUCTION', req.user.id, 'FPO pool auction created']
+    );
     await client.query(`INSERT INTO auctions(lot_id,floor_price_inr,current_highest_bid_inr,ends_at) VALUES($1,$2,$2,NOW()+INTERVAL '24 hours')`, [created.rows[0].id, floor]);
     await client.query('COMMIT');
     res.status(201).json({ pooledLot: created.rows[0] });

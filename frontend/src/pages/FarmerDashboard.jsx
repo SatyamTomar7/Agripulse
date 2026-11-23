@@ -56,7 +56,7 @@ export default function FarmerDashboard({ user, onPendingChange }) {
     setQueue(await db.pendingLots.toArray());
     try {
       const token = localStorage.getItem('agripulse_token');
-      const res = await axios.get(`${API}/api/v1/lots`, { headers:{ Authorization:`Bearer ${token}` }, params:{ districtId:district } });
+      const res = await axios.get(`${API}/api/v1/lots`, { headers:{ Authorization:`Bearer ${token}` }, params:{ mine:'true' } });
       setLots(res.data.lots);
     } catch {}
   };
@@ -165,6 +165,25 @@ export default function FarmerDashboard({ user, onPendingChange }) {
     await onPendingChange?.();
   };
 
+  const cancelLot = async lot => {
+    if (!window.confirm(`Cancel lot ${lot.lot_code}?`)) return;
+    try {
+      const token = localStorage.getItem('agripulse_token');
+      await axios.post(`${API}/api/v1/lots/${lot.id}/cancel`, { reason:'Canceled from farmer dashboard' }, { headers:{ Authorization:`Bearer ${token}` } });
+      setMessage(`Lot ${lot.lot_code} canceled`);
+      await refresh();
+    } catch (error) { setMessage(error.response?.data?.message || 'Unable to cancel lot'); }
+  };
+
+  const relistLot = async lot => {
+    try {
+      const token = localStorage.getItem('agripulse_token');
+      await axios.post(`${API}/api/v1/lots/${lot.id}/relist`, {}, { headers:{ Authorization:`Bearer ${token}` } });
+      setMessage(`Lot ${lot.lot_code} relisted`);
+      await refresh();
+    } catch (error) { setMessage(error.response?.data?.message || 'Unable to relist lot'); }
+  };
+
   const submitQuality = async lot => {
     try {
       const token = localStorage.getItem('agripulse_token');
@@ -224,7 +243,7 @@ export default function FarmerDashboard({ user, onPendingChange }) {
       </section>
       <section className="lg:col-span-3 rounded-xl border bg-white p-5 shadow-sm">
         <div className="flex items-center justify-between"><h2 className="text-xl font-black">My Lots & Sync Queue</h2><button onClick={exportCsv} className="rounded-lg border px-3 py-2 text-sm font-bold">CSV Export</button></div>
-        <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b text-slate-500"><th className="py-2">Lot</th><th>Crop</th><th>Quantity</th><th>Status</th><th>Quality</th></tr></thead><tbody>{lots.map(l=><tr key={l.id} className="border-b"><td className="py-3">{l.lot_code}</td><td>{l.crop_code}</td><td>{l.quantity_quintals} q</td><td><span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-bold">{l.status}</span></td><td>{l.quality_card?.assessmentStatus === 'VERIFIED' ? <span className="font-bold text-emerald-700">Verified</span> : <button onClick={()=>submitQuality(l)} className="rounded border border-emerald-700 px-2 py-1 text-xs font-bold text-emerald-800">Submit Quality</button>}</td></tr>)}</tbody></table></div>
+        <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b text-slate-500"><th className="py-2">Lot</th><th>Crop</th><th>Quantity</th><th>Status</th><th>Quality</th><th>Actions</th></tr></thead><tbody>{lots.map(l=><tr key={l.id} className="border-b"><td className="py-3">{l.lot_code}</td><td>{l.crop_code}</td><td>{l.quantity_quintals} q</td><td><span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-bold">{l.status}</span></td><td>{l.quality_card?.assessmentStatus === 'VERIFIED' ? <span className="font-bold text-emerald-700">Verified</span> : <button onClick={()=>submitQuality(l)} className="rounded border border-emerald-700 px-2 py-1 text-xs font-bold text-emerald-800">Submit Quality</button>}</td><td>{['LISTED','POOLED','DRAFT'].includes(l.status) ? <button onClick={()=>cancelLot(l)} className="text-xs font-bold text-red-700">Cancel</button> : l.status === 'CANCELED' ? <button onClick={()=>relistLot(l)} className="text-xs font-bold text-emerald-700">Relist</button> : null}</td></tr>)}</tbody></table></div>
       </section>
     </div>
   );

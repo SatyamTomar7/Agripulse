@@ -88,6 +88,20 @@ CREATE TABLE IF NOT EXISTS crop_lots (
   synced_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS lot_status_history (
+  id SERIAL PRIMARY KEY,
+  lot_id INTEGER NOT NULL REFERENCES crop_lots(id) ON DELETE CASCADE,
+  previous_status VARCHAR(25),
+  new_status VARCHAR(25) NOT NULL,
+  changed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reason TEXT,
+  changed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE crop_lots DROP CONSTRAINT IF EXISTS crop_lots_status_check;
+ALTER TABLE crop_lots ADD CONSTRAINT crop_lots_status_check
+  CHECK (status IN ('DRAFT','LISTED','POOLED','IN_AUCTION','SOLD','DISPATCHED','DELIVERED','CANCELED'));
+
 CREATE TABLE IF NOT EXISTS quality_assessments (
   id SERIAL PRIMARY KEY,
   lot_id INTEGER NOT NULL REFERENCES crop_lots(id) ON DELETE CASCADE,
