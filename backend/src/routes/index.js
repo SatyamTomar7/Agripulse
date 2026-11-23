@@ -566,27 +566,80 @@ router.patch('/lots/:lotId/quality/:status', verifyToken, requireRole('FPO_ADMIN
   res.json({ assessment: result.rows[0] });
 });
 
+router.post('/lots/pool/preview', verifyToken, requireRole('FPO_ADMIN'), async (req, res, next) => {
+  try {
+    const { lotIds } = req.body;
+    if (!Array.isArray(lotIds) || !lotIds.length) throw Object.assign(new Error('lotIds is required'), { status: 400 });
+    const lots = await query('SELECT * FROM crop_lots WHERE id=ANY($1::int[])', [lotIds]);
+    if (!lots.rows.length || lots.rows.length !== lotIds.length) throw Object.assign(new Error('One or more lots were not found'), { status: 404 });
+    const first = lots.rows[0];
+    const quantity = lots.rows.reduce((sum, lot) => sum + Number(lot.quantity_quintals), 0);
+    const weightedMoisture = quantity ? lots.rows.reduce((sum, lot) => sum + Number(lot.moisture_pct) * Number(lot.quantity_quintals), 0) / quantity : 0;
+    const weightedFloor = quantity ? lots.rows.reduce((sum, lot) => sum + Number(lot.recommended_floor_inr) * Number(lot.quantity_quintals), 0) / quantity : 0;
+    const fpo = await query('SELECT fpo_min_load_quintals,fpo_pool_capacity_quintals FROM users WHERE id=$1', [req.user.id]);
+    const minimum = Number(fpo.rows[0]?.fpo_min_load_quintals || 50);
+    const capacity = Number(fpo.rows[0]?.fpo_pool_capacity_quintals || 5000);
+    res.json({
+      canPool:
+        lots.rows.every(lot => lot.status === 'LISTED') &&
+        lots.rows.every(lot => lot.quality_card?.assessmentStatus === 'VERIFIED') &&
+        lots.rows.every(lot => lot.crop_code === first.crop_code) &&
+        lots.rows.every(lot => lot.grade === first.grade) &&
+        lots.rows.every(lot => lot.district_id === req.user.districtId) &&
+        quantity >= minimum && quantity <= capacity,
+      cropCode:first.crop_code,
+      grade:first.grade,
+      districtId:first.district_id,
+      totalQuintals:quantity,
+      minimumQuintals:minimum,
+      capacityQuintals:capacity,
+      weightedMoisturePct:Number(weightedMoisture.toFixed(2)),
+      weightedFloorInr:Number(weightedFloor.toFixed(2)),
+      lotCount:lots.rows.length
+    });
+  } catch (err) { next(err); }
+});
+
 router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { lotIds } = req.body;
     if (!Array.isArray(lotIds) || !lotIds.length) throw Object.assign(new Error('lotIds is required'), { status: 400 });
+    if (lotIds.length !== new Set(lotIds.map(Number)).size) throw Object.assign(new Error('Duplicate lot IDs are not allowed'), { status: 400 });
     const lots = await client.query('SELECT * FROM crop_lots WHERE id=ANY($1::int[]) FOR UPDATE', [lotIds]);
     const first = lots.rows[0];
+    if (!first || lots.rows.length !== lotIds.length) throw Object.assign(new Error('One or more lots were not found'), { status: 404 });
     if (lots.rows.some(lot => lot.status !== 'LISTED')) throw Object.assign(new Error('Only listed lots can be pooled'), { status: 409, code: 'LOT_NOT_LISTED' });
     if (lots.rows.some(lot => lot.quality_card?.assessmentStatus !== 'VERIFIED')) throw Object.assign(new Error('All lots must have verified quality assessments'), { status: 409, code: 'QUALITY_NOT_VERIFIED' });
-    if (!first || new Set(lots.rows.map(l => l.crop_code)).size !== 1 || new Set(lots.rows.map(l => l.grade)).size !== 1) {
+    if (new Set(lots.rows.map(l => l.crop_code)).size !== 1 || new Set(lots.rows.map(l => l.grade)).size !== 1) {
       throw Object.assign(new Error('Lots must have the same crop and grade'), { status: 400, code: 'POOL_MISMATCH' });
     }
+    if (new Set(lots.rows.map(l => l.district_id)).size !== 1 || lots.rows[0].district_id !== req.user.districtId) {
+      throw Object.assign(new Error('Lots must belong to the FPO district'), { status: 400, code: 'DISTRICT_MISMATCH' });
+    }
     const quantity = lots.rows.reduce((sum, l) => sum + Number(l.quantity_quintals), 0);
-    const floor = Math.max(...lots.rows.map(l => Number(l.recommended_floor_inr)));
-    const districtId = lots.rows.map(l => l.district_id).join(',');
+    const weightedMoisture = quantity ? lots.rows.reduce((sum, l) => sum + Number(l.moisture_pct) * Number(l.quantity_quintals), 0) / quantity : 0;
+    const weightedFloor = quantity ? lots.rows.reduce((sum, l) => sum + Number(l.recommended_floor_inr) * Number(l.quantity_quintals), 0) / quantity : 0;
+    const floor = Number(weightedFloor.toFixed(2));
+    const fpo = await client.query('SELECT fpo_min_load_quintals,fpo_pool_capacity_quintals FROM users WHERE id=$1', [req.user.id]);
+    const minimum = Number(fpo.rows[0]?.fpo_min_load_quintals || 50);
+    const capacity = Number(fpo.rows[0]?.fpo_pool_capacity_quintals || 5000);
+    if (quantity < minimum) throw Object.assign(new Error(`Pool must contain at least ${minimum} quintals`), { status: 400, code: 'BELOW_MINIMUM_LOAD' });
+    if (quantity > capacity) throw Object.assign(new Error(`Pool cannot exceed ${capacity} quintals`), { status: 400, code: 'OVER_POOL_CAPACITY' });
+    const districtId = lots.rows[0].district_id;
     const lotCode = `POOL-${Date.now().toString(36).toUpperCase()}`;
     const created = await client.query(
       `INSERT INTO crop_lots(lot_code,client_event_id,farmer_id,fpo_batch_id,crop_code,quantity_quintals,moisture_pct,grade,district_id,recommended_floor_inr,quality_card,captured_at,status)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'{}',$11,'IN_AUCTION') RETURNING *`,
-      [lotCode, uuidv4(), req.user.id, first.id, first.crop_code, quantity, first.moisture_pct, first.grade, districtId, floor, new Date()]
+      [lotCode, uuidv4(), req.user.id, first.id, first.crop_code, quantity, weightedMoisture.toFixed(2), first.grade, districtId, floor,
+       new Date()]
+    );
+    await client.query(
+      `UPDATE crop_lots SET quality_card=jsonb_build_object('assessmentStatus','VERIFIED','poolSizeQuintals',$1,
+       'weightedMoisturePct',$2,'weightedFloorInr',$3,'sourceLotIds',$4::text[])
+       WHERE id=$5`,
+      [quantity, weightedMoisture.toFixed(2), floor, lotIds.map(String), created.rows[0].id]
     );
     await client.query('UPDATE crop_lots SET status=\'POOLED\', fpo_batch_id=$1 WHERE id=ANY($2::int[])', [created.rows[0].id, lotIds]);
     await client.query(

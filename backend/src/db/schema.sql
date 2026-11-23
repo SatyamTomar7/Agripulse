@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS users (
   bank_account_last4 VARCHAR(4),
   kyc_status VARCHAR(20) DEFAULT 'PENDING' CHECK (kyc_status IN ('PENDING', 'SUBMITTED', 'VERIFIED', 'REJECTED')),
   account_status VARCHAR(20) DEFAULT 'PENDING' CHECK (account_status IN ('PENDING', 'APPROVED', 'REJECTED')),
+  fpo_min_load_quintals NUMERIC(10,2) DEFAULT 50,
+  fpo_pool_capacity_quintals NUMERIC(10,2) DEFAULT 5000,
   preferred_lang VARCHAR(10) DEFAULT 'en',
   created_at TIMESTAMPTZ DEFAULT NOW()
 );

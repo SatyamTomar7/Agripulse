@@ -6,6 +6,7 @@ export default function FpoPoolDashboard() {
   const [lots, setLots] = useState([]);
   const [selected, setSelected] = useState([]);
   const [message, setMessage] = useState('');
+  const [preview, setPreview] = useState(null);
   const token = localStorage.getItem('agripulse_token');
   const headers = { Authorization:`Bearer ${token}` };
   const load = async () => {
@@ -17,12 +18,18 @@ export default function FpoPoolDashboard() {
   useEffect(()=>{load();},[]);
   const toggle = id => setSelected(s => s.includes(id) ? s.filter(x=>x!==id) : [...s,id]);
   const compatible = selected.length ? lots.find(l=>l.id===selected[0]) : null;
+  const showPreview = async () => {
+    try {
+      const res = await axios.post(`${API}/api/v1/lots/pool/preview`, { lotIds:selected }, { headers });
+      setPreview(res.data);
+    } catch (err) { setMessage(err.response?.data?.message || 'Unable to preview pool'); }
+  };
   const pool = async () => {
     try {
       const ids = selected;
       const res = await axios.post(`${API}/api/v1/lots/pool`, { lotIds:ids }, { headers });
       setMessage(`Pooled lot ${res.data.pooledLot.lot_code} into a bulk auction.`);
-      setSelected([]); await load();
+      setSelected([]); setPreview(null); await load();
     } catch (err) { setMessage(err.response?.data?.message || 'Pooling failed'); }
   };
   const verifyQuality = async (lot, status) => {
@@ -34,8 +41,15 @@ export default function FpoPoolDashboard() {
   };
   return (
     <section>
-      <div className="mb-5 flex items-end justify-between"><div><p className="text-sm font-bold text-emerald-700">FPO Aggregation</p><h1 className="text-3xl font-black">Bulk Truckload Pool</h1></div><button disabled={!selected.length} onClick={pool} className="rounded-lg bg-emerald-700 px-5 py-3 font-bold text-white disabled:opacity-40">Pool Selected Lots</button></div>
+      <div className="mb-5 flex items-end justify-between"><div><p className="text-sm font-bold text-emerald-700">FPO Aggregation</p><h1 className="text-3xl font-black">Bulk Truckload Pool</h1></div><button disabled={!selected.length} onClick={showPreview} className="rounded-lg bg-emerald-700 px-5 py-3 font-bold text-white disabled:opacity-40">Preview Pool</button></div>
       {message && <p className="mb-4 rounded-lg bg-emerald-50 p-3 text-sm font-semibold text-emerald-800">{message}</p>}
+      {preview && <div className="mb-5 rounded-xl border border-emerald-300 bg-emerald-50 p-4">
+        <h2 className="font-black">Pool Preview</h2>
+        <p className="mt-2 text-sm">{preview.lotCount} lots · {preview.totalQuintals} quintals · {preview.cropCode} · Grade {preview.grade}</p>
+        <p className="text-sm">Weighted moisture {preview.weightedMoisturePct}% · Weighted floor ₹{preview.weightedFloorInr}</p>
+        <p className="mt-1 text-xs text-slate-600">Minimum {preview.minimumQuintals}q · Capacity {preview.capacityQuintals}q</p>
+        <div className="mt-3 flex gap-2"><button disabled={!preview.canPool} onClick={pool} className="rounded bg-emerald-700 px-4 py-2 text-sm font-bold text-white disabled:opacity-40">Confirm Pool</button><button onClick={()=>setPreview(null)} className="rounded border px-4 py-2 text-sm font-bold">Cancel</button></div>
+      </div>}
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">{lots.map(l=>{
         const allowed = !compatible || (compatible.crop_code===l.crop_code && compatible.grade===l.grade);
         const qualityStatus = l.quality_card?.assessmentStatus || 'SUBMITTED';
