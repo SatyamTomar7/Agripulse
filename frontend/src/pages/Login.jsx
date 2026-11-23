@@ -27,6 +27,7 @@ export default function Login({ onLogin }) {
         : { fullName: fullName.trim(), phone: phone.trim(), password, role, districtId: districtId.trim().toUpperCase() };
       const response = await axios.post(`${API}/api/v1/auth/${endpoint}`, payload);
       localStorage.setItem('agripulse_token', response.data.token);
+      localStorage.setItem('agripulse_refresh_token', response.data.refreshToken);
       localStorage.setItem('agripulse_user', JSON.stringify(response.data.user));
       onLogin(response.data.user);
     } catch (err) { setError(err.response?.data?.message || `Unable to ${mode}`); }

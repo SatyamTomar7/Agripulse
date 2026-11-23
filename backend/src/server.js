@@ -9,5 +9,9 @@ const app = createApp(io);
 httpServer.removeAllListeners('request');
 httpServer.on('request', app);
 
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET is required in production');
+}
+
 const port = Number(process.env.PORT || 4000);
 httpServer.listen(port, () => console.log(`AgriPulse API listening on port ${port}`));

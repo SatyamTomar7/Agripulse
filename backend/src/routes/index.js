@@ -1,6 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { validate: validateUuid, v4: uuidv4 } = require('uuid');
 const { query, pool } = require('../config/db');
 const { verifyToken, requireRole } = require('../middleware/auth');
@@ -8,17 +9,38 @@ const { calculateFloor, validate: validatePrice } = require('../services/fairPri
 const priceCache = require('../services/priceCacheService');
 
 const router = express.Router();
+const authSecret = () => {
+  const secret = process.env.JWT_SECRET;
+  if (process.env.NODE_ENV === 'production' && !secret) throw Object.assign(new Error('Server authentication is not configured'), { status: 500, code: 'AUTH_CONFIG_ERROR' });
+  return secret || 'development-secret';
+};
 const tokenFor = user => jwt.sign(
   { id: user.id, phone: user.phone, role: user.role, districtId: user.district_id },
-  process.env.JWT_SECRET || 'development-secret',
-  { expiresIn: '12h' }
+  authSecret(),
+  { expiresIn: '15m', jwtid: crypto.randomUUID() }
 );
+const refreshTokenFor = () => crypto.randomBytes(48).toString('hex');
+const refreshTokenHash = token => crypto.createHash('sha256').update(token).digest('hex');
+const issueRefreshToken = async (userId) => {
+  const token = refreshTokenFor();
+  await query(
+    'INSERT INTO refresh_tokens(user_id, token_hash, expires_at) VALUES($1,$2,NOW()+INTERVAL \'7 days\')',
+    [userId, refreshTokenHash(token)]
+  );
+  return token;
+};
+const authResponse = async user => ({
+  token: tokenFor(user),
+  refreshToken: await issueRefreshToken(user.id),
+  user: publicUser(user)
+});
 const publicUser = user => ({
   id: user.id,
   fullName: user.full_name,
   phone: user.phone,
   role: user.role,
-  districtId: user.district_id
+  districtId: user.district_id,
+  preferredLang: user.preferred_lang || 'en'
 });
 const isUuidV4 = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) && validateUuid(value);
 const optionalAuth = (req, res, next) => {
@@ -32,31 +54,121 @@ router.post('/auth/register', async (req, res, next) => {
     const { fullName, phone, password, role, districtId } = req.body;
     if (!fullName || !phone || !password || !role || !districtId) throw Object.assign(new Error('All registration fields are required'), { status: 400 });
     if (password.length < 8) throw Object.assign(new Error('Password must be at least 8 characters'), { status: 400 });
+    if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(password)) throw Object.assign(new Error('Password must contain uppercase, lowercase, and a number'), { status: 400 });
+    if (!/^[6-9]\d{9}$/.test(String(phone).replace(/\D/g, '').slice(-10))) throw Object.assign(new Error('Enter a valid 10-digit Indian mobile number'), { status: 400 });
     if (!['FARMER','FPO_ADMIN','BUYER','LOGISTICS'].includes(role)) throw Object.assign(new Error('Invalid role'), { status: 400 });
     const passwordHash = await bcrypt.hash(password, 12);
     let result;
     try {
       result = await query(
         'INSERT INTO users(full_name,phone,password_hash,role,district_id) VALUES($1,$2,$3,$4,$5) RETURNING *',
-        [fullName.trim(), phone.trim(), passwordHash, role, districtId.trim().toUpperCase()]
+        [fullName.trim(), String(phone).replace(/\D/g, '').slice(-10), passwordHash, role, districtId.trim().toUpperCase()]
       );
     } catch (err) {
       if (err.code === '23505') throw Object.assign(new Error('A user with this phone number already exists'), { status: 409, code: 'PHONE_EXISTS' });
       throw err;
     }
     const user = result.rows[0];
-    res.status(201).json({ token: tokenFor(user), user: publicUser(user) });
+    res.status(201).json(await authResponse(user));
   } catch (err) { next(err); }
 });
 
 router.post('/auth/login', async (req, res, next) => {
   try {
     const { phone, password } = req.body;
-    const result = await query('SELECT * FROM users WHERE phone=$1', [phone]);
+    if (!phone || !password) throw Object.assign(new Error('Phone and password are required'), { status: 400 });
+    const normalizedPhone = String(phone).replace(/\D/g, '').slice(-10);
+    const result = await query('SELECT * FROM users WHERE phone=$1', [normalizedPhone]);
     if (!result.rows.length) throw Object.assign(new Error('Invalid phone or password'), { status: 401, code: 'INVALID_CREDENTIALS' });
     const user = result.rows[0];
     if (!await bcrypt.compare(password, user.password_hash)) throw Object.assign(new Error('Invalid phone or password'), { status: 401, code: 'INVALID_CREDENTIALS' });
-    res.json({ token: tokenFor(user), user: publicUser(user) });
+    res.json(await authResponse(user));
+  } catch (err) { next(err); }
+});
+
+router.post('/auth/refresh', async (req, res, next) => {
+  try {
+    const refreshToken = req.body.refreshToken;
+    if (!refreshToken) throw Object.assign(new Error('Refresh token is required'), { status: 400 });
+    const hash = refreshTokenHash(refreshToken);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `SELECT rt.id,rt.user_id,u.full_name,u.phone,u.role,u.district_id,u.preferred_lang
+         FROM refresh_tokens rt JOIN users u ON u.id=rt.user_id
+         WHERE rt.token_hash=$1 AND rt.revoked_at IS NULL AND rt.expires_at>NOW()
+         FOR UPDATE`,
+        [hash]
+      );
+      if (!result.rows.length) throw Object.assign(new Error('Refresh session is invalid or expired'), { status: 401, code: 'INVALID_REFRESH_TOKEN' });
+      const row = result.rows[0];
+      await client.query('UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1', [row.id]);
+      const user = { id:row.user_id, full_name:row.full_name, phone:row.phone, role:row.role, district_id:row.district_id, preferred_lang:row.preferred_lang };
+      const token = tokenFor(user);
+      const nextRefreshToken = refreshTokenFor();
+      await client.query(
+        'INSERT INTO refresh_tokens(user_id,token_hash,expires_at) VALUES($1,$2,NOW()+INTERVAL \'7 days\')',
+        [row.user_id, refreshTokenHash(nextRefreshToken)]
+      );
+      await client.query('COMMIT');
+      res.json({ token, refreshToken: nextRefreshToken, user: publicUser(user) });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) { next(err); }
+});
+
+router.post('/auth/logout', async (req, res, next) => {
+  try {
+    const refreshToken = req.body.refreshToken;
+    if (refreshToken) await query('UPDATE refresh_tokens SET revoked_at=NOW() WHERE token_hash=$1', [refreshTokenHash(refreshToken)]);
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+router.get('/auth/me', verifyToken, async (req, res, next) => {
+  try {
+    const result = await query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!result.rows.length) throw Object.assign(new Error('Account not found'), { status: 404 });
+    res.json({ user: publicUser(result.rows[0]) });
+  } catch (err) { next(err); }
+});
+
+router.patch('/auth/me', verifyToken, async (req, res, next) => {
+  try {
+    const fullName = req.body.fullName?.trim();
+    const districtId = req.body.districtId?.trim().toUpperCase();
+    const preferredLang = req.body.preferredLang?.toLowerCase();
+    if (fullName !== undefined && (fullName.length < 2 || fullName.length > 120)) throw Object.assign(new Error('Full name must contain 2 to 120 characters'), { status: 400 });
+    if (districtId !== undefined && (districtId.length < 2 || districtId.length > 50)) throw Object.assign(new Error('Invalid district'), { status: 400 });
+    if (preferredLang !== undefined && !['en', 'hi'].includes(preferredLang)) throw Object.assign(new Error('Unsupported language'), { status: 400 });
+    const result = await query(
+      `UPDATE users SET
+       full_name=COALESCE($1,full_name),
+       district_id=COALESCE($2,district_id),
+       preferred_lang=COALESCE($3,preferred_lang)
+       WHERE id=$4 RETURNING *`,
+      [fullName ?? null, districtId ?? null, preferredLang ?? null, req.user.id]
+    );
+    res.json({ user: publicUser(result.rows[0]) });
+  } catch (err) { next(err); }
+});
+
+router.post('/auth/change-password', verifyToken, async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) throw Object.assign(new Error('Current and new passwords are required'), { status: 400 });
+    if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(newPassword)) throw Object.assign(new Error('Password must contain uppercase, lowercase, and a number'), { status: 400 });
+    const result = await query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!result.rows.length || !await bcrypt.compare(currentPassword, result.rows[0].password_hash)) throw Object.assign(new Error('Current password is incorrect'), { status: 401 });
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    await query('UPDATE users SET password_hash=$1 WHERE id=$2', [passwordHash, req.user.id]);
+    await query('UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL', [req.user.id]);
+    res.json({ success: true, message: 'Password changed successfully' });
   } catch (err) { next(err); }
 });
 

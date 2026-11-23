@@ -5,7 +5,9 @@ function verifyToken(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ success: false, message: 'Authentication required', code: 'UNAUTHORIZED' });
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET || 'development-secret');
+    const secret = process.env.JWT_SECRET;
+    if (!secret) return res.status(500).json({ success: false, message: 'Server authentication is not configured', code: 'AUTH_CONFIG_ERROR' });
+    req.user = jwt.verify(token, secret);
     next();
   } catch {
     res.status(401).json({ success: false, message: 'Invalid or expired token', code: 'UNAUTHORIZED' });

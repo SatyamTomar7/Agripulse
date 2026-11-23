@@ -8,6 +8,7 @@ import BuyerAuctionPortal from './pages/BuyerAuctionPortal';
 import LogisticsTracker from './pages/LogisticsTracker';
 import { startSyncManager } from './services/syncManager';
 import { db } from './db/offlineDb';
+import AccountSettings from './components/AccountSettings';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
@@ -34,10 +35,43 @@ export default function App() {
 
   const refreshPending = async () => setPendingCount(await db.pendingLots.where('syncStatus').equals('PENDING').count());
   const logout = () => {
+    const refreshToken = localStorage.getItem('agripulse_refresh_token');
+    if (refreshToken) axios.post(`${API}/api/v1/auth/logout`, { refreshToken }).catch(() => {});
     localStorage.removeItem('agripulse_token');
+    localStorage.removeItem('agripulse_refresh_token');
     localStorage.removeItem('agripulse_user');
     setUser(null);
   };
+
+  useEffect(() => {
+    const interceptor = axios.interceptors.response.use(
+      response => response,
+      async error => {
+        const original = error.config;
+        if (error.response?.status !== 401 || original?._authRetry) throw error;
+        const refreshToken = localStorage.getItem('agripulse_refresh_token');
+        if (!refreshToken) throw error;
+        try {
+          const response = await axios.post(`${API}/api/v1/auth/refresh`, { refreshToken });
+          localStorage.setItem('agripulse_token', response.data.token);
+          localStorage.setItem('agripulse_refresh_token', response.data.refreshToken);
+          localStorage.setItem('agripulse_user', JSON.stringify(response.data.user));
+          setUser(response.data.user);
+          original._authRetry = true;
+          original.headers = original.headers || {};
+          original.headers.Authorization = `Bearer ${response.data.token}`;
+          return axios(original);
+        } catch {
+          localStorage.removeItem('agripulse_token');
+          localStorage.removeItem('agripulse_refresh_token');
+          localStorage.removeItem('agripulse_user');
+          setUser(null);
+          throw error;
+        }
+      }
+    );
+    return () => axios.interceptors.response.eject(interceptor);
+  }, []);
 
   if (!user) return (
     <div className="min-h-screen bg-emerald-50">
@@ -55,7 +89,10 @@ export default function App() {
             <p className="text-xs font-bold uppercase tracking-widest text-emerald-700">AgriPulse</p>
             <p className="text-sm text-slate-600">{user.fullName} · {user.role}</p>
           </div>
-          <button onClick={logout} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700">Logout</button>
+          <div className="flex items-center gap-2">
+            <AccountSettings user={user} onUpdated={setUser} />
+            <button onClick={logout} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700">Logout</button>
+          </div>
         </div>
       </header>
       <main className="mx-auto max-w-7xl px-4 py-6">

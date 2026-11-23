@@ -1,6 +1,7 @@
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
 const { calculateFloor, validate } = require('../src/services/fairPriceEngine');
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
 jest.mock('../src/config/db', () => ({
   query: jest.fn(),
