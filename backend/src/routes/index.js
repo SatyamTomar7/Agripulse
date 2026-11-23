@@ -40,6 +40,12 @@ const publicUser = user => ({
   phone: user.phone,
   role: user.role,
   districtId: user.district_id,
+  stateName: user.state_name || 'Madhya Pradesh',
+  village: user.village || '',
+  address: user.address || '',
+  bankAccountLast4: user.bank_account_last4 || '',
+  kycStatus: user.kyc_status || 'PENDING',
+  accountStatus: user.account_status || 'PENDING',
   preferredLang: user.preferred_lang || 'en'
 });
 const isUuidV4 = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) && validateUuid(value);
@@ -49,20 +55,38 @@ const optionalAuth = (req, res, next) => {
   return verifyToken(req, res, next);
 };
 
+router.get('/master-data', async (req, res, next) => {
+  try {
+    const [districtResult, cropResult] = await Promise.all([
+      query('SELECT code,name,state_name FROM districts WHERE active=TRUE ORDER BY name'),
+      query('SELECT code,name FROM crops WHERE active=TRUE ORDER BY name')
+    ]);
+    res.json({
+      districts: districtResult.rows.map(row => ({ code: row.code, name: row.name, stateName: row.state_name })),
+      crops: cropResult.rows.map(row => ({ code: row.code, name: row.name }))
+    });
+  } catch (err) { next(err); }
+});
+
 router.post('/auth/register', async (req, res, next) => {
   try {
-    const { fullName, phone, password, role, districtId } = req.body;
+    const { fullName, phone, password, role, districtId, stateName, village, address } = req.body;
     if (!fullName || !phone || !password || !role || !districtId) throw Object.assign(new Error('All registration fields are required'), { status: 400 });
     if (password.length < 8) throw Object.assign(new Error('Password must be at least 8 characters'), { status: 400 });
     if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/.test(password)) throw Object.assign(new Error('Password must contain uppercase, lowercase, and a number'), { status: 400 });
     if (!/^[6-9]\d{9}$/.test(String(phone).replace(/\D/g, '').slice(-10))) throw Object.assign(new Error('Enter a valid 10-digit Indian mobile number'), { status: 400 });
     if (!['FARMER','FPO_ADMIN','BUYER','LOGISTICS'].includes(role)) throw Object.assign(new Error('Invalid role'), { status: 400 });
+    const district = await query('SELECT code,state_name FROM districts WHERE code=$1 AND active=TRUE', [districtId.trim().toUpperCase()]);
+    if (!district.rows.length) throw Object.assign(new Error('Select a valid district'), { status: 400, code: 'INVALID_DISTRICT' });
+    const accountStatus = role === 'FARMER' ? 'APPROVED' : 'PENDING';
     const passwordHash = await bcrypt.hash(password, 12);
     let result;
     try {
       result = await query(
-        'INSERT INTO users(full_name,phone,password_hash,role,district_id) VALUES($1,$2,$3,$4,$5) RETURNING *',
-        [fullName.trim(), String(phone).replace(/\D/g, '').slice(-10), passwordHash, role, districtId.trim().toUpperCase()]
+        `INSERT INTO users(full_name,phone,password_hash,role,district_id,state_name,village,address,account_status)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [fullName.trim(), String(phone).replace(/\D/g, '').slice(-10), passwordHash, role, districtId.trim().toUpperCase(),
+         stateName?.trim() || district.rows[0].state_name, village?.trim() || null, address?.trim() || null, accountStatus]
       );
     } catch (err) {
       if (err.code === '23505') throw Object.assign(new Error('A user with this phone number already exists'), { status: 409, code: 'PHONE_EXISTS' });
@@ -82,6 +106,8 @@ router.post('/auth/login', async (req, res, next) => {
     if (!result.rows.length) throw Object.assign(new Error('Invalid phone or password'), { status: 401, code: 'INVALID_CREDENTIALS' });
     const user = result.rows[0];
     if (!await bcrypt.compare(password, user.password_hash)) throw Object.assign(new Error('Invalid phone or password'), { status: 401, code: 'INVALID_CREDENTIALS' });
+    if (user.account_status === 'REJECTED') throw Object.assign(new Error('Your account registration was rejected'), { status: 403, code: 'ACCOUNT_REJECTED' });
+    if (user.account_status === 'PENDING' && user.role !== 'FARMER') throw Object.assign(new Error('Your account is awaiting approval'), { status: 403, code: 'ACCOUNT_PENDING' });
     res.json(await authResponse(user));
   } catch (err) { next(err); }
 });
@@ -95,7 +121,8 @@ router.post('/auth/refresh', async (req, res, next) => {
     try {
       await client.query('BEGIN');
       const result = await client.query(
-        `SELECT rt.id,rt.user_id,u.full_name,u.phone,u.role,u.district_id,u.preferred_lang
+        `SELECT rt.id,rt.user_id,u.full_name,u.phone,u.role,u.district_id,u.state_name,u.village,u.address,
+                u.bank_account_last4,u.kyc_status,u.account_status,u.preferred_lang
          FROM refresh_tokens rt JOIN users u ON u.id=rt.user_id
          WHERE rt.token_hash=$1 AND rt.revoked_at IS NULL AND rt.expires_at>NOW()
          FOR UPDATE`,
@@ -104,7 +131,9 @@ router.post('/auth/refresh', async (req, res, next) => {
       if (!result.rows.length) throw Object.assign(new Error('Refresh session is invalid or expired'), { status: 401, code: 'INVALID_REFRESH_TOKEN' });
       const row = result.rows[0];
       await client.query('UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1', [row.id]);
-      const user = { id:row.user_id, full_name:row.full_name, phone:row.phone, role:row.role, district_id:row.district_id, preferred_lang:row.preferred_lang };
+      const user = { id:row.user_id, full_name:row.full_name, phone:row.phone, role:row.role, district_id:row.district_id,
+        state_name:row.state_name, village:row.village, address:row.address, bank_account_last4:row.bank_account_last4,
+        kyc_status:row.kyc_status, account_status:row.account_status, preferred_lang:row.preferred_lang };
       const token = tokenFor(user);
       const nextRefreshToken = refreshTokenFor();
       await client.query(
@@ -143,16 +172,32 @@ router.patch('/auth/me', verifyToken, async (req, res, next) => {
     const fullName = req.body.fullName?.trim();
     const districtId = req.body.districtId?.trim().toUpperCase();
     const preferredLang = req.body.preferredLang?.toLowerCase();
+    const stateName = req.body.stateName?.trim();
+    const village = req.body.village?.trim();
+    const address = req.body.address?.trim();
+    const bankAccountLast4 = req.body.bankAccountLast4?.trim();
+    const kycStatus = req.body.kycStatus;
     if (fullName !== undefined && (fullName.length < 2 || fullName.length > 120)) throw Object.assign(new Error('Full name must contain 2 to 120 characters'), { status: 400 });
-    if (districtId !== undefined && (districtId.length < 2 || districtId.length > 50)) throw Object.assign(new Error('Invalid district'), { status: 400 });
+    if (districtId !== undefined) {
+      const district = await query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [districtId]);
+      if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400, code: 'INVALID_DISTRICT' });
+    }
     if (preferredLang !== undefined && !['en', 'hi'].includes(preferredLang)) throw Object.assign(new Error('Unsupported language'), { status: 400 });
+    if (bankAccountLast4 !== undefined && bankAccountLast4 && !/^\d{4}$/.test(bankAccountLast4)) throw Object.assign(new Error('Bank account suffix must contain exactly 4 digits'), { status: 400 });
+    if (kycStatus !== undefined && kycStatus !== 'PENDING' && kycStatus !== 'SUBMITTED') throw Object.assign(new Error('Only KYC submission status may be set by a user'), { status: 403 });
     const result = await query(
       `UPDATE users SET
        full_name=COALESCE($1,full_name),
        district_id=COALESCE($2,district_id),
-       preferred_lang=COALESCE($3,preferred_lang)
-       WHERE id=$4 RETURNING *`,
-      [fullName ?? null, districtId ?? null, preferredLang ?? null, req.user.id]
+       preferred_lang=COALESCE($3,preferred_lang),
+       state_name=COALESCE($4,state_name),
+       village=COALESCE($5,village),
+       address=COALESCE($6,address),
+       bank_account_last4=COALESCE($7,bank_account_last4),
+       kyc_status=COALESCE($8,kyc_status)
+       WHERE id=$9 RETURNING *`,
+      [fullName ?? null, districtId ?? null, preferredLang ?? null, stateName ?? null, village ?? null, address ?? null,
+       bankAccountLast4 ?? null, kycStatus ?? null, req.user.id]
     );
     res.json({ user: publicUser(result.rows[0]) });
   } catch (err) { next(err); }
@@ -169,6 +214,41 @@ router.post('/auth/change-password', verifyToken, async (req, res, next) => {
     await query('UPDATE users SET password_hash=$1 WHERE id=$2', [passwordHash, req.user.id]);
     await query('UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL', [req.user.id]);
     res.json({ success: true, message: 'Password changed successfully' });
+  } catch (err) { next(err); }
+});
+
+router.get('/admin/accounts', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT id,full_name,phone,role,district_id,state_name,village,address,bank_account_last4,
+              kyc_status,account_status,preferred_lang,created_at
+       FROM users WHERE role!='ADMIN' ORDER BY created_at DESC`
+    );
+    res.json({ accounts: result.rows });
+  } catch (err) { next(err); }
+});
+
+router.patch('/admin/accounts/:id/approval', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    if (!['APPROVED','REJECTED'].includes(req.body.accountStatus)) throw Object.assign(new Error('Invalid account status'), { status: 400 });
+    const result = await query(
+      'UPDATE users SET account_status=$1 WHERE id=$2 AND role!=\'ADMIN\' RETURNING id,full_name,role,account_status',
+      [req.body.accountStatus, req.params.id]
+    );
+    if (!result.rows.length) throw Object.assign(new Error('Account not found'), { status: 404 });
+    res.json({ account: result.rows[0] });
+  } catch (err) { next(err); }
+});
+
+router.patch('/admin/accounts/:id/kyc', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    if (!['PENDING','SUBMITTED','VERIFIED','REJECTED'].includes(req.body.kycStatus)) throw Object.assign(new Error('Invalid KYC status'), { status: 400 });
+    const result = await query(
+      'UPDATE users SET kyc_status=$1 WHERE id=$2 AND role!=\'ADMIN\' RETURNING id,full_name,role,kyc_status',
+      [req.body.kycStatus, req.params.id]
+    );
+    if (!result.rows.length) throw Object.assign(new Error('Account not found'), { status: 404 });
+    res.json({ account: result.rows[0] });
   } catch (err) { next(err); }
 });
 

@@ -3,11 +3,40 @@ CREATE TABLE IF NOT EXISTS users (
   full_name VARCHAR(120) NOT NULL,
   phone VARCHAR(15) UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
-  role VARCHAR(20) CHECK (role IN ('FARMER', 'FPO_ADMIN', 'BUYER', 'LOGISTICS')) NOT NULL,
+  role VARCHAR(20) CHECK (role IN ('FARMER', 'FPO_ADMIN', 'BUYER', 'LOGISTICS', 'ADMIN')) NOT NULL,
   district_id VARCHAR(50) NOT NULL,
+  state_name VARCHAR(50) DEFAULT 'Madhya Pradesh',
+  village VARCHAR(120),
+  address TEXT,
+  bank_account_last4 VARCHAR(4),
+  kyc_status VARCHAR(20) DEFAULT 'PENDING' CHECK (kyc_status IN ('PENDING', 'SUBMITTED', 'VERIFIED', 'REJECTED')),
+  account_status VARCHAR(20) DEFAULT 'PENDING' CHECK (account_status IN ('PENDING', 'APPROVED', 'REJECTED')),
   preferred_lang VARCHAR(10) DEFAULT 'en',
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS districts (
+  code VARCHAR(50) PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  state_name VARCHAR(50) NOT NULL,
+  active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS crops (
+  code VARCHAR(30) PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  active BOOLEAN DEFAULT TRUE
+);
+
+INSERT INTO districts(code,name,state_name) VALUES
+  ('GWALIOR','Gwalior','Madhya Pradesh'),('INDORE','Indore','Madhya Pradesh'),
+  ('BHOPAL','Bhopal','Madhya Pradesh'),('JABALPUR','Jabalpur','Madhya Pradesh')
+ON CONFLICT(code) DO NOTHING;
+
+INSERT INTO crops(code,name) VALUES
+  ('WHEAT','Wheat'),('PADDY_COMMON','Paddy (Common)'),('SOYBEAN','Soybean'),
+  ('MUSTARD','Mustard'),('CHICKPEA','Chickpea')
+ON CONFLICT(code) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   id SERIAL PRIMARY KEY,
@@ -93,6 +122,7 @@ INSERT INTO users (full_name, phone, password_hash, role, district_id) VALUES
   ('ITC Agri Procurement', '9876543212', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'BUYER', 'INDORE'),
   ('MP ColdChain Fleet', '9876543213', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'LOGISTICS', 'GWALIOR')
 ON CONFLICT (phone) DO UPDATE SET password_hash=EXCLUDED.password_hash;
+UPDATE users SET account_status='APPROVED' WHERE role IN ('FARMER','FPO_ADMIN','BUYER','LOGISTICS');
 
 INSERT INTO mandi_prices (district_id, crop_code, modal_price_inr, msp_inr, arrival_quintals) VALUES
   ('GWALIOR','WHEAT',2520,2425,1200),('GWALIOR','PADDY_COMMON',2440,2369,850),

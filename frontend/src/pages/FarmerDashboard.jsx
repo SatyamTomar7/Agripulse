@@ -5,8 +5,6 @@ import { db } from '../db/offlineDb';
 import { syncPendingLots } from '../services/syncManager';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
-const crops = ['WHEAT','PADDY_COMMON','SOYBEAN','MUSTARD','CHICKPEA'];
-const districts = ['GWALIOR','INDORE','BHOPAL','JABALPUR'];
 const msp = { WHEAT:2425,PADDY_COMMON:2369,SOYBEAN:4892,MUSTARD:5950,CHICKPEA:5650 };
 const modalFallback = { WHEAT:2520,PADDY_COMMON:2440,SOYBEAN:5100,MUSTARD:6120,CHICKPEA:5800 };
 
@@ -19,9 +17,21 @@ export default function FarmerDashboard({ user, onPendingChange }) {
   const [lots, setLots] = useState([]);
   const [queue, setQueue] = useState([]);
   const [message, setMessage] = useState('');
+  const [crops, setCrops] = useState([
+    { code:'WHEAT', name:'Wheat' },{ code:'PADDY_COMMON', name:'Paddy (Common)' },
+    { code:'SOYBEAN', name:'Soybean' },{ code:'MUSTARD', name:'Mustard' },{ code:'CHICKPEA', name:'Chickpea' }
+  ]);
+  const [districts, setDistricts] = useState([
+    { code:'GWALIOR', name:'Gwalior' },{ code:'INDORE', name:'Indore' },
+    { code:'BHOPAL', name:'Bhopal' },{ code:'JABALPUR', name:'Jabalpur' }
+  ]);
 
   useEffect(() => {
     refresh();
+    axios.get(`${API}/api/v1/master-data`).then(response => {
+      setCrops(response.data.crops);
+      setDistricts(response.data.districts);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -29,8 +39,8 @@ export default function FarmerDashboard({ user, onPendingChange }) {
     (async () => {
       for (const d of districts) for (const c of crops) {
         try {
-          const res = await axios.get(`${API}/api/v1/advisory/fair-price`, { params:{ cropCode:c,districtId:d,grade:'A',moisturePct:11 } });
-          await db.mandiCache.put({ districtId:d,cropCode:c,modalPriceInr:res.data.mandiModalInr,mspInr:res.data.mspInr,cachedAt:Date.now() });
+          const res = await axios.get(`${API}/api/v1/advisory/fair-price`, { params:{ cropCode:c.code,districtId:d.code,grade:'A',moisturePct:11 } });
+          await db.mandiCache.put({ districtId:d.code,cropCode:c.code,modalPriceInr:res.data.mandiModalInr,mspInr:res.data.mspInr,cachedAt:Date.now() });
         } catch {}
       }
     })();
@@ -89,8 +99,8 @@ export default function FarmerDashboard({ user, onPendingChange }) {
       <section className="rounded-xl border bg-white p-5 shadow-sm">
         <h2 className="text-xl font-black">Fair-Price Calculator</h2>
         <div className="mt-4 grid grid-cols-2 gap-3">
-          <label className="text-sm font-semibold">Crop<select value={crop} onChange={e=>setCrop(e.target.value)} className="mt-1 w-full rounded border p-2">{crops.map(c=><option key={c}>{c}</option>)}</select></label>
-          <label className="text-sm font-semibold">District<select value={district} onChange={e=>setDistrict(e.target.value)} className="mt-1 w-full rounded border p-2">{districts.map(d=><option key={d}>{d}</option>)}</select></label>
+          <label className="text-sm font-semibold">Crop<select value={crop} onChange={e=>setCrop(e.target.value)} className="mt-1 w-full rounded border p-2">{crops.map(c=><option key={c.code} value={c.code}>{c.name}</option>)}</select></label>
+          <label className="text-sm font-semibold">District<select value={district} onChange={e=>setDistrict(e.target.value)} className="mt-1 w-full rounded border p-2">{districts.map(d=><option key={d.code} value={d.code}>{d.name}</option>)}</select></label>
           <label className="text-sm font-semibold">Grade<select value={grade} onChange={e=>setGrade(e.target.value)} className="mt-1 w-full rounded border p-2"><option>A</option><option>B</option><option>C</option></select></label>
           <label className="text-sm font-semibold">Moisture %<input type="number" min="0" max="45" value={moisture} onChange={e=>setMoisture(e.target.value)} className="mt-1 w-full rounded border p-2"/></label>
         </div>

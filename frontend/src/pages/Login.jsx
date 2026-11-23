@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import axios from 'axios';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
@@ -16,7 +16,14 @@ export default function Login({ onLogin }) {
   const [fullName, setFullName] = useState('');
   const [role, setRole] = useState('FARMER');
   const [districtId, setDistrictId] = useState('GWALIOR');
+  const [stateName, setStateName] = useState('Madhya Pradesh');
+  const [village, setVillage] = useState('');
+  const [address, setAddress] = useState('');
+  const [districts, setDistricts] = useState([{ code:'GWALIOR', name:'Gwalior', stateName:'Madhya Pradesh' }]);
   const [error, setError] = useState('');
+  useEffect(() => {
+    axios.get(`${API}/api/v1/master-data`).then(response => setDistricts(response.data.districts)).catch(() => {});
+  }, []);
   const submit = async event => {
     event?.preventDefault?.();
     setError('');
@@ -24,7 +31,7 @@ export default function Login({ onLogin }) {
       const endpoint = mode === 'login' ? 'login' : 'register';
       const payload = mode === 'login'
         ? { phone: phone.trim(), password }
-        : { fullName: fullName.trim(), phone: phone.trim(), password, role, districtId: districtId.trim().toUpperCase() };
+        : { fullName: fullName.trim(), phone: phone.trim(), password, role, districtId: districtId.trim().toUpperCase(), stateName, village, address };
       const response = await axios.post(`${API}/api/v1/auth/${endpoint}`, payload);
       localStorage.setItem('agripulse_token', response.data.token);
       localStorage.setItem('agripulse_refresh_token', response.data.refreshToken);
@@ -59,7 +66,15 @@ export default function Login({ onLogin }) {
                 <option value="BUYER">Buyer</option>
                 <option value="LOGISTICS">Logistics</option>
               </select>
-              <input aria-label="District" required value={districtId} onChange={e => setDistrictId(e.target.value)} placeholder="District (e.g. GWALIOR)" className="w-full rounded-lg border px-4 py-3"/>
+              <select aria-label="District" required value={districtId} onChange={e => {
+                const selected = districts.find(d => d.code === e.target.value);
+                setDistrictId(e.target.value);
+                setStateName(selected?.stateName || 'Madhya Pradesh');
+              }} className="w-full rounded-lg border bg-white px-4 py-3">
+                {districts.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}
+              </select>
+              <input aria-label="Village" value={village} onChange={e => setVillage(e.target.value)} placeholder="Village" className="w-full rounded-lg border px-4 py-3"/>
+              <input aria-label="Address" value={address} onChange={e => setAddress(e.target.value)} placeholder="Address" className="w-full rounded-lg border px-4 py-3"/>
             </>}
             <input aria-label="Phone" name="username" autoComplete="username" required value={phone} onChange={e => setPhone(e.target.value)} placeholder="Mobile number" className="w-full rounded-lg border px-4 py-3"/>
             <input aria-label="Password" name="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} required minLength={8} type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password (min. 8 characters)" className="w-full rounded-lg border px-4 py-3"/>
