@@ -126,6 +126,10 @@ CREATE TABLE IF NOT EXISTS auctions (
   floor_price_inr NUMERIC(10,2) NOT NULL,
   current_highest_bid_inr NUMERIC(10,2) NOT NULL,
   min_increment_inr NUMERIC(10,2) DEFAULT 25.00,
+  reserve_price_inr NUMERIC(10,2),
+  duration_seconds INTEGER DEFAULT 86400,
+  auto_extend_seconds INTEGER DEFAULT 300,
+  starts_at TIMESTAMPTZ DEFAULT NOW(),
   highest_bidder_id INTEGER REFERENCES users(id) NULL,
   status VARCHAR(20) DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED', 'SETTLED')),
   ends_at TIMESTAMPTZ NOT NULL

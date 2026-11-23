@@ -651,7 +651,17 @@ router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res
       'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,$2,$3,$4,$5)',
       [created.rows[0].id, 'LISTED', 'IN_AUCTION', req.user.id, 'FPO pool auction created']
     );
-    await client.query(`INSERT INTO auctions(lot_id,floor_price_inr,current_highest_bid_inr,ends_at) VALUES($1,$2,$2,NOW()+INTERVAL '24 hours')`, [created.rows[0].id, floor]);
+    const durationSeconds = Number.isInteger(Number(req.body.durationSeconds)) && Number(req.body.durationSeconds) >= 300
+      ? Number(req.body.durationSeconds) : 86400;
+    const minIncrement = Number(req.body.minIncrementInr) > 0 ? Number(req.body.minIncrementInr) : 25;
+    const reservePrice = req.body.reservePriceInr != null && Number(req.body.reservePriceInr) > 0 ? Number(req.body.reservePriceInr) : floor;
+    const autoExtendSeconds = Number.isInteger(Number(req.body.autoExtendSeconds)) && Number(req.body.autoExtendSeconds) >= 60
+      ? Number(req.body.autoExtendSeconds) : 300;
+    await client.query(
+      `INSERT INTO auctions(lot_id,floor_price_inr,current_highest_bid_inr,min_increment_inr,reserve_price_inr,duration_seconds,auto_extend_seconds,ends_at)
+       VALUES($1,$2,$2,$3,$4,$5,$6,NOW()+($5 * INTERVAL '1 second'))`,
+      [created.rows[0].id, floor, minIncrement, reservePrice, durationSeconds, autoExtendSeconds]
+    );
     await client.query('COMMIT');
     res.status(201).json({ pooledLot: created.rows[0] });
   } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
@@ -665,19 +675,42 @@ router.get('/auctions', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+router.get('/auctions/owned', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT a.*,l.lot_code,l.crop_code,l.quantity_quintals,l.moisture_pct,l.grade,l.district_id
+       FROM auctions a JOIN crop_lots l ON l.id=a.lot_id
+       WHERE l.farmer_id=$1 AND a.status='CLOSED' AND a.highest_bidder_id IS NOT NULL
+       ORDER BY a.ends_at DESC`,
+      [req.user.id]
+    );
+    res.json({ auctions: result.rows });
+  } catch (err) { next(err); }
+});
+
 router.post('/auctions/:auctionId/bids', verifyToken, requireRole('BUYER'), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const auctionResult = await client.query('SELECT * FROM auctions WHERE id=$1 FOR UPDATE', [req.params.auctionId]);
+    const auctionId = Number(req.params.auctionId);
+    if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
+    const auctionResult = await client.query('SELECT * FROM auctions WHERE id=$1 FOR UPDATE', [auctionId]);
     if (!auctionResult.rows.length) throw Object.assign(new Error('Auction not found'), { status: 404 });
     const auction = auctionResult.rows[0];
     if (auction.status !== 'OPEN') throw Object.assign(new Error('Auction is closed'), { status: 409, code: 'AUCTION_CLOSED' });
     if (new Date(auction.ends_at) <= new Date()) throw Object.assign(new Error('Auction has expired'), { status: 409, code: 'AUCTION_EXPIRED' });
+    if (new Date(auction.starts_at) > new Date()) throw Object.assign(new Error('Auction has not started'), { status: 409, code: 'AUCTION_NOT_STARTED' });
     const amount = Number(req.body.bidAmountInr);
     const minimum = Number(auction.current_highest_bid_inr) + Number(auction.min_increment_inr);
     if (!Number.isFinite(amount) || amount < minimum) throw Object.assign(new Error(`Minimum bid is ₹${minimum}`), { status: 400, code: 'BID_TOO_LOW' });
-    await client.query('UPDATE auctions SET current_highest_bid_inr=$1,highest_bidder_id=$2 WHERE id=$3', [amount, req.user.id, auction.id]);
+    if (req.user.id === auction.highest_bidder_id) throw Object.assign(new Error('You already hold the highest bid'), { status: 409, code: 'ALREADY_HIGH_BIDDER' });
+    if (auction.reserve_price_inr && amount < Number(auction.reserve_price_inr)) throw Object.assign(new Error(`Bid must meet the reserve price of ₹${auction.reserve_price_inr}`), { status: 400, code: 'RESERVE_NOT_MET' });
+    let newEndsAt = auction.ends_at;
+    const secondsRemaining = (new Date(auction.ends_at).getTime() - Date.now()) / 1000;
+    if (secondsRemaining <= Number(auction.auto_extend_seconds || 300)) {
+      newEndsAt = new Date(Date.now() + Number(auction.auto_extend_seconds || 300)).toISOString();
+    }
+    await client.query('UPDATE auctions SET current_highest_bid_inr=$1,highest_bidder_id=$2,ends_at=$3 WHERE id=$4', [amount, req.user.id, newEndsAt, auction.id]);
     await client.query('INSERT INTO bids(auction_id,bidder_id,bid_amount_inr) VALUES($1,$2,$3)', [auction.id, req.user.id, amount]);
     await client.query('COMMIT');
     req.app.get('io')?.emit('bid:updated', { auctionId: auction.id, currentHighestBidInr: amount, highestBidderId: req.user.id });
@@ -685,17 +718,41 @@ router.post('/auctions/:auctionId/bids', verifyToken, requireRole('BUYER'), asyn
   } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
 
+router.get('/auctions/:auctionId/bids', verifyToken, async (req, res, next) => {
+  try {
+    const auctionId = Number(req.params.auctionId);
+    if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
+    const result = await query(
+      `SELECT b.id,b.bid_amount_inr,b.created_at,u.full_name,u.id AS bidder_id
+       FROM bids b JOIN users u ON u.id=b.bidder_id
+       WHERE b.auction_id=$1
+       ORDER BY b.bid_amount_inr DESC,b.created_at DESC`,
+      [auctionId]
+    );
+    res.json({ bids: result.rows });
+  } catch (err) { next(err); }
+});
+
 router.post('/auctions/:auctionId/accept', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const result = await client.query(`SELECT a.*,l.farmer_id FROM auctions a JOIN crop_lots l ON l.id=a.lot_id WHERE a.id=$1 FOR UPDATE`, [req.params.auctionId]);
+    const auctionId = Number(req.params.auctionId);
+    if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
+    const result = await client.query(`SELECT a.*,l.farmer_id,l.fpo_batch_id,l.status AS lot_status FROM auctions a JOIN crop_lots l ON l.id=a.lot_id WHERE a.id=$1 FOR UPDATE`, [auctionId]);
     if (!result.rows.length) throw Object.assign(new Error('Auction not found'), { status: 404 });
     const auction = result.rows[0];
-    if (auction.status !== 'OPEN') throw Object.assign(new Error('Auction is closed'), { status: 409 });
+    if (req.user.role === 'FARMER' && auction.farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+    if (req.user.role === 'FPO_ADMIN' && auction.farmer_id !== req.user.id) throw Object.assign(new Error('Only the FPO that created this pool can accept it'), { status: 403 });
+    if (!['OPEN','CLOSED'].includes(auction.status)) throw Object.assign(new Error('Auction is not available for acceptance'), { status: 409 });
+    if (new Date(auction.ends_at) > new Date()) throw Object.assign(new Error('Auction cannot be accepted before it expires'), { status: 409, code: 'AUCTION_STILL_OPEN' });
     if (!auction.highest_bidder_id) throw Object.assign(new Error('No bid to accept'), { status: 400 });
     await client.query('UPDATE auctions SET status=\'CLOSED\' WHERE id=$1', [auction.id]);
     await client.query('UPDATE crop_lots SET status=\'SOLD\' WHERE id=$1', [auction.lot_id]);
+    await client.query(
+      'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,$2,$3,$4,$5)',
+      [auction.lot_id, auction.lot_status, 'SOLD', req.user.id, 'Winning bid accepted']
+    );
     await client.query(`INSERT INTO escrow_dispatches(auction_id,buyer_id,farmer_id,total_amount_inr) VALUES($1,$2,$3,$4)
       ON CONFLICT(auction_id) DO NOTHING`, [auction.id, auction.highest_bidder_id, auction.farmer_id, auction.current_highest_bid_inr]);
     await client.query('COMMIT');
