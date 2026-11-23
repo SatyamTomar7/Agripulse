@@ -777,9 +777,27 @@ router.get('/dispatches', verifyToken, async (req, res, next) => {
       params.push(req.user.id); where = `WHERE buyer_id=$${params.length}`;
     } else if (req.user?.role === 'FARMER') {
       params.push(req.user.id); where = `WHERE farmer_id=$${params.length}`;
+    } else if (req.user?.role === 'LOGISTICS') {
+      params.push(req.user.id); where = `WHERE logistics_user_id=$${params.length}`;
     }
     const result = await query(`SELECT * FROM escrow_dispatches ${where} ORDER BY id DESC`, params);
     res.json({ dispatches: result.rows });
+  } catch (err) { next(err); }
+});
+
+router.get('/dispatches/:id/history', verifyToken, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) throw Object.assign(new Error('Invalid dispatch ID'), { status: 400 });
+    const dispatch = await query('SELECT * FROM escrow_dispatches WHERE id=$1', [id]);
+    if (!dispatch.rows.length) throw Object.assign(new Error('Dispatch not found'), { status: 404 });
+    const row = dispatch.rows[0];
+    if (![row.farmer_id,row.buyer_id,row.logistics_user_id].includes(req.user.id) && req.user.role !== 'ADMIN') throw Object.assign(new Error('Forbidden'), { status: 403 });
+    const history = await query(
+      'SELECT previous_status,new_status,changed_by,latitude,longitude,note,changed_at FROM dispatch_status_history WHERE dispatch_id=$1 ORDER BY changed_at DESC',
+      [id]
+    );
+    res.json({ history:history.rows });
   } catch (err) { next(err); }
 });
 
@@ -911,27 +929,61 @@ router.post('/payments/webhook', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.patch('/dispatches/:id/status', verifyToken, requireRole('LOGISTICS','FARMER','BUYER'), async (req, res, next) => {
+router.post('/dispatches/:id/assign', verifyToken, requireRole('ADMIN','FPO_ADMIN'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const logisticsUserId = Number(req.body.logisticsUserId);
+    if (!Number.isInteger(id) || id < 1 || !Number.isInteger(logisticsUserId) || logisticsUserId < 1) throw Object.assign(new Error('Invalid dispatch or logistics user ID'), { status: 400 });
+    const logistics = await query("SELECT id,role,account_status FROM users WHERE id=$1", [logisticsUserId]);
+    if (!logistics.rows.length || logistics.rows[0].role !== 'LOGISTICS') throw Object.assign(new Error('Logistics user not found'), { status: 404 });
+    if (logistics.rows[0].account_status !== 'APPROVED') throw Object.assign(new Error('Logistics account is not approved'), { status: 409 });
+    if (!req.body.vehicleNumber || req.body.vehicleNumber.trim().length < 3) throw Object.assign(new Error('Vehicle number is required'), { status: 400 });
+    const otp = String(Math.floor(100000 + crypto.randomInt(900000)));
+    const result = await query(
+      `UPDATE escrow_dispatches SET logistics_user_id=$1,vehicle_number=$2,origin_address=$3,
+       destination_address=$4,expected_delivery_at=$5,delivery_otp_hash=$6,updated_at=NOW()
+       WHERE id=$7 RETURNING *`,
+      [logisticsUserId, req.body.vehicleNumber.trim().toUpperCase(), req.body.originAddress || null,
+       req.body.destinationAddress || null, req.body.expectedDeliveryAt || null,
+       crypto.createHash('sha256').update(otp).digest('hex'), id]
+    );
+    if (!result.rows.length) throw Object.assign(new Error('Dispatch not found'), { status: 404 });
+    res.status(201).json({ dispatch:result.rows[0], deliveryOtp:otp });
+  } catch (err) { next(err); }
+});
+
+router.patch('/dispatches/:id/status', verifyToken, requireRole('LOGISTICS'), async (req, res, next) => {
   const transitions = { PENDING_PICKUP: 'IN_TRANSIT', IN_TRANSIT: 'DELIVERED' };
   try {
     const existing = await query('SELECT * FROM escrow_dispatches WHERE id=$1', [req.params.id]);
     if (!existing.rows.length) throw Object.assign(new Error('Dispatch not found'), { status: 404 });
     const current = existing.rows[0];
-    if (req.user.role === 'LOGISTICS') {
-      // Assignment will be enforced when logistics users and dispatch assignments are introduced.
-    } else if (req.user.role === 'FARMER' && current.farmer_id !== req.user.id) {
-      throw Object.assign(new Error('Forbidden'), { status: 403 });
-    } else if (req.user.role === 'BUYER' && current.buyer_id !== req.user.id) {
-      throw Object.assign(new Error('Forbidden'), { status: 403 });
-    }
+    if (current.logistics_user_id !== req.user.id) throw Object.assign(new Error('Dispatch is not assigned to you'), { status: 403 });
     if (req.body.logisticsStatus !== 'DELIVERED' && req.body.logisticsStatus !== 'IN_TRANSIT') {
       throw Object.assign(new Error('Invalid logistics status'), { status: 400 });
     }
     if (transitions[current.logistics_status] !== req.body.logisticsStatus) throw Object.assign(new Error('Invalid status transition'), { status: 409 });
-    const delivered = req.body.logisticsStatus === 'DELIVERED';
+    const lat = Number(req.body.currentLat);
+    const lng = Number(req.body.currentLng);
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) throw Object.assign(new Error('Valid GPS coordinates are required'), { status: 400 });
+    if (req.body.logisticsStatus === 'DELIVERED') {
+      if (!req.body.deliveryOtp || !/^\d{6}$/.test(String(req.body.deliveryOtp))) throw Object.assign(new Error('A valid 6-digit delivery OTP is required'), { status: 400 });
+      const otpHash = crypto.createHash('sha256').update(String(req.body.deliveryOtp)).digest('hex');
+      if (!current.delivery_otp_hash || otpHash !== current.delivery_otp_hash) throw Object.assign(new Error('Invalid delivery OTP'), { status: 400, code: 'INVALID_DELIVERY_OTP' });
+    }
     const result = await query(`UPDATE escrow_dispatches SET logistics_status=$1,vehicle_number=COALESCE($2,vehicle_number),
-      current_lat=COALESCE($3,current_lat),current_lng=COALESCE($4,current_lng),updated_at=NOW() WHERE id=$5 RETURNING *`,
-      [req.body.logisticsStatus, req.body.vehicleNumber, req.body.currentLat, req.body.currentLng, req.params.id]);
+      current_lat=$3,current_lng=$4,
+      pickup_lat=CASE WHEN $1='IN_TRANSIT' THEN $3 ELSE pickup_lat END,
+      pickup_lng=CASE WHEN $1='IN_TRANSIT' THEN $4 ELSE pickup_lng END,
+      delivery_lat=CASE WHEN $1='DELIVERED' THEN $3 ELSE delivery_lat END,
+      delivery_lng=CASE WHEN $1='DELIVERED' THEN $4 ELSE delivery_lng END,
+      updated_at=NOW() WHERE id=$5 RETURNING *`,
+      [req.body.logisticsStatus, req.body.vehicleNumber, lat, lng, req.params.id]);
+    await query(
+      'INSERT INTO dispatch_status_history(dispatch_id,previous_status,new_status,changed_by,latitude,longitude,note) VALUES($1,$2,$3,$4,$5,$6,$7)',
+      [req.params.id,current.logistics_status,req.body.logisticsStatus,req.user.id,lat,lng,req.body.note?.trim() || null]
+    );
+    req.app.get('io')?.emit('dispatch:updated', result.rows[0]);
     res.json({ dispatch: result.rows[0] });
   } catch (err) { next(err); }
 });

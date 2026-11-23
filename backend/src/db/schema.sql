@@ -148,13 +148,34 @@ CREATE TABLE IF NOT EXISTS escrow_dispatches (
   auction_id INTEGER UNIQUE REFERENCES auctions(id),
   buyer_id INTEGER REFERENCES users(id),
   farmer_id INTEGER REFERENCES users(id),
+  logistics_user_id INTEGER REFERENCES users(id),
   total_amount_inr NUMERIC(12,2) NOT NULL,
   escrow_status VARCHAR(20) DEFAULT 'LOCKED' CHECK (escrow_status IN ('LOCKED', 'RELEASED', 'REFUNDED')),
   logistics_status VARCHAR(25) DEFAULT 'PENDING_PICKUP' CHECK (logistics_status IN ('PENDING_PICKUP', 'IN_TRANSIT', 'DELIVERED')),
   vehicle_number VARCHAR(25) NULL,
+  origin_address TEXT,
+  destination_address TEXT,
+  expected_delivery_at TIMESTAMPTZ,
+  pickup_lat DOUBLE PRECISION,
+  pickup_lng DOUBLE PRECISION,
+  delivery_lat DOUBLE PRECISION,
+  delivery_lng DOUBLE PRECISION,
+  delivery_otp_hash CHAR(64),
   current_lat DOUBLE PRECISION DEFAULT 26.2183,
   current_lng DOUBLE PRECISION DEFAULT 78.1828,
   updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_status_history (
+  id SERIAL PRIMARY KEY,
+  dispatch_id INTEGER NOT NULL REFERENCES escrow_dispatches(id) ON DELETE CASCADE,
+  previous_status VARCHAR(25),
+  new_status VARCHAR(25) NOT NULL,
+  changed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  latitude DOUBLE PRECISION,
+  longitude DOUBLE PRECISION,
+  note TEXT,
+  changed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS payment_transactions (
