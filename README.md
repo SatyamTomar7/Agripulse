@@ -2,6 +2,8 @@
 
 AgriPulse is an offline-first agricultural marketplace prototype for farmers, FPOs, buyers, and logistics providers. It supports lot registration and synchronization, manual quality review, FPO pooling, auctions, dispatch tracking, account/KYC administration, and manually maintained mandi prices.
 
+For architecture, workflows, API groups, data model, security notes, and outstanding release blockers, see the [developer system overview](docs/SYSTEM_OVERVIEW.md).
+
 ## Local setup
 
 1. Create a PostgreSQL database and apply `backend/src/db/schema.sql`.
