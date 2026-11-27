@@ -149,13 +149,51 @@ export default function FarmerDashboard({ user, onPendingChange }) {
       setMessage('Photo must be smaller than 2 MB.');
       return;
     }
-    const dataUrl = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
+    let uploadFile = file;
+    let bitmap;
+    try {
+      if (file.size > 200 * 1024) {
+        if (typeof createImageBitmap !== 'function') throw new Error('Photo compression is not supported by this browser.');
+        bitmap = await createImageBitmap(file);
+        const canvas = document.createElement('canvas');
+        let scale = Math.min(1, 1200 / Math.max(bitmap.width, bitmap.height));
+        let quality = 0.72;
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+          canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+          canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          uploadFile = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+          if (!uploadFile) throw new Error('Unable to compress photo.');
+          if (uploadFile.size <= 200 * 1024) break;
+          scale *= 0.85;
+          quality *= 0.8;
+        }
+        if (uploadFile.size > 200 * 1024) throw new Error('Photo could not be compressed below the 200 KB sync limit.');
+      }
+    } catch (error) {
+      setMessage(error.message || 'Unable to process photo.');
+      return;
+    } finally {
+      bitmap?.close();
+    }
+    let dataUrl;
+    try {
+      dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(uploadFile);
+      });
+    } catch {
+      setMessage('Unable to read the selected photo.');
+      return;
+    }
+    if (dataUrl.length > 280000) {
+      setMessage('Photo is too large to sync. Please choose a smaller image.');
+      return;
+    }
     setCapturedPhoto(dataUrl);
+    setMessage('Photo attached and compressed for offline sync.');
   };
 
   const retryQueue = async () => {
@@ -182,6 +220,17 @@ export default function FarmerDashboard({ user, onPendingChange }) {
       setMessage(`Lot ${lot.lot_code} relisted`);
       await refresh();
     } catch (error) { setMessage(error.response?.data?.message || 'Unable to relist lot'); }
+  };
+
+  const startAuction = async lot => {
+    try {
+      const token = localStorage.getItem('agripulse_token');
+      await axios.post(`${API}/api/v1/lots/${lot.id}/auction`, {}, { headers:{ Authorization:`Bearer ${token}` } });
+      setMessage(`Auction created for ${lot.lot_code}`);
+      await refresh();
+    } catch (error) {
+      setMessage(error.response?.data?.message || 'Unable to create auction');
+    }
   };
 
   const submitQuality = async lot => {
@@ -243,7 +292,7 @@ export default function FarmerDashboard({ user, onPendingChange }) {
       </section>
       <section className="lg:col-span-3 rounded-xl border bg-white p-5 shadow-sm">
         <div className="flex items-center justify-between"><h2 className="text-xl font-black">My Lots & Sync Queue</h2><button onClick={exportCsv} className="rounded-lg border px-3 py-2 text-sm font-bold">CSV Export</button></div>
-        <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b text-slate-500"><th className="py-2">Lot</th><th>Crop</th><th>Quantity</th><th>Status</th><th>Quality</th><th>Actions</th></tr></thead><tbody>{lots.map(l=><tr key={l.id} className="border-b"><td className="py-3">{l.lot_code}</td><td>{l.crop_code}</td><td>{l.quantity_quintals} q</td><td><span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-bold">{l.status}</span></td><td>{l.quality_card?.assessmentStatus === 'VERIFIED' ? <span className="font-bold text-emerald-700">Verified</span> : <button onClick={()=>submitQuality(l)} className="rounded border border-emerald-700 px-2 py-1 text-xs font-bold text-emerald-800">Submit Quality</button>}</td><td>{['LISTED','POOLED','DRAFT'].includes(l.status) ? <button onClick={()=>cancelLot(l)} className="text-xs font-bold text-red-700">Cancel</button> : l.status === 'CANCELED' ? <button onClick={()=>relistLot(l)} className="text-xs font-bold text-emerald-700">Relist</button> : null}</td></tr>)}</tbody></table></div>
+        <div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b text-slate-500"><th className="py-2">Lot</th><th>Crop</th><th>Quantity</th><th>Status</th><th>Quality</th><th>Actions</th></tr></thead><tbody>{lots.map(l=><tr key={l.id} className="border-b"><td className="py-3">{l.lot_code}</td><td>{l.crop_code}</td><td>{l.quantity_quintals} q</td><td><span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-bold">{l.status}</span></td><td>{l.quality_card?.assessmentStatus === 'VERIFIED' ? <span className="font-bold text-emerald-700">Verified</span> : <button onClick={()=>submitQuality(l)} className="rounded border border-emerald-700 px-2 py-1 text-xs font-bold text-emerald-800">Submit Quality</button>}</td><td className="space-x-2">{l.status === 'LISTED' && l.quality_card?.assessmentStatus === 'VERIFIED' && <button onClick={()=>startAuction(l)} className="text-xs font-bold text-emerald-700">List for auction</button>}{['LISTED','POOLED','DRAFT'].includes(l.status) ? <button onClick={()=>cancelLot(l)} className="text-xs font-bold text-red-700">Cancel</button> : l.status === 'CANCELED' ? <button onClick={()=>relistLot(l)} className="text-xs font-bold text-emerald-700">Relist</button> : null}</td></tr>)}</tbody></table></div>
       </section>
     </div>
   );

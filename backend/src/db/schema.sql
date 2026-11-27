@@ -22,7 +22,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS village VARCHAR(120);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS bank_account_last4 VARCHAR(4);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(20) DEFAULT 'PENDING';
-ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status VARCHAR(20) DEFAULT 'APPROVED';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status VARCHAR(20) DEFAULT 'PENDING';
+ALTER TABLE users ALTER COLUMN account_status SET DEFAULT 'PENDING';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS fpo_min_load_quintals NUMERIC(10,2) DEFAULT 50;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS fpo_pool_capacity_quintals NUMERIC(10,2) DEFAULT 5000;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_lang VARCHAR(10) DEFAULT 'en';
@@ -66,9 +67,12 @@ CREATE TABLE IF NOT EXISTS mandi_prices (
   modal_price_inr NUMERIC(10,2) NOT NULL,
   msp_inr NUMERIC(10,2) NOT NULL,
   arrival_quintals NUMERIC(10,2) DEFAULT 0,
+  source VARCHAR(120) NOT NULL DEFAULT 'SEEDED SAMPLE DATA',
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(district_id, crop_code)
 );
+
+ALTER TABLE mandi_prices ADD COLUMN IF NOT EXISTS source VARCHAR(120) NOT NULL DEFAULT 'SEEDED SAMPLE DATA';
 
 CREATE TABLE IF NOT EXISTS mandi_price_history (
   id SERIAL PRIMARY KEY,
@@ -252,14 +256,6 @@ CREATE INDEX IF NOT EXISTS idx_mandi_lookup ON mandi_prices(district_id, crop_co
 CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status);
 CREATE INDEX IF NOT EXISTS idx_bids_auction ON bids(auction_id);
 
-INSERT INTO users (full_name, phone, password_hash, role, district_id) VALUES
-  ('Ramesh Singh', '9876543210', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'FARMER', 'GWALIOR'),
-  ('Chambal FPO Manager', '9876543211', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'FPO_ADMIN', 'GWALIOR'),
-  ('ITC Agri Procurement', '9876543212', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'BUYER', 'INDORE'),
-  ('MP ColdChain Fleet', '9876543213', '$2a$12$7IGrYm8J7fcrQMhK0o20x.1jeo4vGXco8Uom59aAe8/FvKkT5/W2S', 'LOGISTICS', 'GWALIOR')
-ON CONFLICT (phone) DO UPDATE SET password_hash=EXCLUDED.password_hash;
-UPDATE users SET account_status='APPROVED' WHERE role IN ('FARMER','FPO_ADMIN','BUYER','LOGISTICS');
-
 INSERT INTO mandi_prices (district_id, crop_code, modal_price_inr, msp_inr, arrival_quintals) VALUES
   ('GWALIOR','WHEAT',2520,2425,1200),('GWALIOR','PADDY_COMMON',2440,2369,850),
   ('GWALIOR','SOYBEAN',5100,4892,640),('GWALIOR','MUSTARD',6120,5950,420),
@@ -273,4 +269,4 @@ INSERT INTO mandi_prices (district_id, crop_code, modal_price_inr, msp_inr, arri
   ('JABALPUR','WHEAT',2500,2425,1100),('JABALPUR','PADDY_COMMON',2510,2369,930),
   ('JABALPUR','SOYBEAN',5060,4892,560),('JABALPUR','MUSTARD',6000,5950,300),
   ('JABALPUR','CHICKPEA',5780,5650,290)
-ON CONFLICT (district_id, crop_code) DO UPDATE SET modal_price_inr=EXCLUDED.modal_price_inr, msp_inr=EXCLUDED.msp_inr, arrival_quintals=EXCLUDED.arrival_quintals;
+ON CONFLICT (district_id, crop_code) DO NOTHING;

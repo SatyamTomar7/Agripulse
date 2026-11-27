@@ -9,8 +9,8 @@ const app = createApp(io);
 httpServer.removeAllListeners('request');
 httpServer.on('request', app);
 
-if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
-  throw new Error('JWT_SECRET is required in production');
+if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || Buffer.byteLength(process.env.JWT_SECRET, 'utf8') < 32)) {
+  throw new Error('JWT_SECRET of at least 32 bytes is required in production');
 }
 
 const port = Number(process.env.PORT || 4000);

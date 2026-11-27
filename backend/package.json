@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "admin:create": "node src/scripts/createAdmin.js",
     "test": "jest --runInBand"
   },
   "dependencies": {

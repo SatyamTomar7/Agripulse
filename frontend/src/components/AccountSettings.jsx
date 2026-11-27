@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import axios from 'axios';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
@@ -6,29 +6,23 @@ const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 export default function AccountSettings({ user, onUpdated }) {
   const [open, setOpen] = useState(false);
   const [fullName, setFullName] = useState(user.fullName);
-  const [districtId, setDistrictId] = useState(user.districtId);
   const [preferredLang, setPreferredLang] = useState(user.preferredLang || 'en');
-  const [stateName, setStateName] = useState(user.stateName || 'Madhya Pradesh');
+  const [stateName] = useState(user.stateName || 'Madhya Pradesh');
   const [village, setVillage] = useState(user.village || '');
   const [address, setAddress] = useState(user.address || '');
   const [bankAccountLast4, setBankAccountLast4] = useState(user.bankAccountLast4 || '');
   const [kycStatus, setKycStatus] = useState(user.kycStatus || 'PENDING');
-  const [districts, setDistricts] = useState([{ code:user.districtId, name:user.districtId, stateName:user.stateName || 'Madhya Pradesh' }]);
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [message, setMessage] = useState('');
   const token = localStorage.getItem('agripulse_token');
   const headers = { Authorization: `Bearer ${token}` };
-  useEffect(() => {
-    axios.get(`${API}/api/v1/master-data`).then(response => setDistricts(response.data.districts)).catch(() => {});
-  }, []);
-
   const saveProfile = async event => {
     event.preventDefault();
     setMessage('');
     try {
       const response = await axios.patch(`${API}/api/v1/auth/me`, {
-        fullName, districtId, preferredLang, stateName, village, address, bankAccountLast4
+        fullName, preferredLang, stateName, village, address, bankAccountLast4
       }, { headers });
       localStorage.setItem('agripulse_user', JSON.stringify(response.data.user));
       onUpdated(response.data.user);
@@ -79,15 +73,7 @@ export default function AccountSettings({ user, onUpdated }) {
               <label className="block text-sm font-semibold">Full name
                 <input required value={fullName} onChange={event => setFullName(event.target.value)} className="mt-1 w-full rounded border p-2"/>
               </label>
-              <label className="block text-sm font-semibold">District
-                <select required value={districtId} onChange={event => {
-                  const selected = districts.find(district => district.code === event.target.value);
-                  setDistrictId(event.target.value);
-                  setStateName(selected?.stateName || 'Madhya Pradesh');
-                }} className="mt-1 w-full rounded border p-2">
-                  {districts.map(district => <option key={district.code} value={district.code}>{district.name}</option>)}
-                </select>
-              </label>
+              <p className="rounded bg-slate-50 p-2 text-sm">District: {user.districtId} <span className="text-xs text-slate-500">(managed by an administrator)</span></p>
               <input aria-label="Village" value={village} onChange={event => setVillage(event.target.value)} placeholder="Village" className="w-full rounded border p-2"/>
               <input aria-label="Address" value={address} onChange={event => setAddress(event.target.value)} placeholder="Address" className="w-full rounded border p-2"/>
               <label className="block text-sm font-semibold">Bank account last 4 digits
@@ -102,7 +88,7 @@ export default function AccountSettings({ user, onUpdated }) {
               <button className="w-full rounded bg-emerald-700 py-2 font-bold text-white">Save profile</button>
             </form>
             <div className="mt-5 flex items-center justify-between rounded-lg border p-3">
-              <div><p className="text-sm font-black">KYC: {kycStatus}</p><p className="text-xs text-slate-500">Account: {user.accountStatus || 'PENDING'}</p></div>
+              <div><p className="text-sm font-black">KYC: {kycStatus}</p><p className="text-xs text-slate-500">Account: {user.accountStatus || 'PENDING'}</p><p className="mt-1 text-xs text-amber-800">Identity documents are reviewed outside this application.</p></div>
               {kycStatus !== 'SUBMITTED' && kycStatus !== 'VERIFIED' && <button type="button" onClick={submitKyc} className="rounded border border-emerald-700 px-3 py-2 text-sm font-bold text-emerald-800">Submit KYC</button>}
             </div>
             <form onSubmit={changePassword} className="mt-6 space-y-3 border-t pt-5">

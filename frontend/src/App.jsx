@@ -10,6 +10,7 @@ import { startSyncManager } from './services/syncManager';
 import { db } from './db/offlineDb';
 import AccountSettings from './components/AccountSettings';
 import NotificationCenter from './components/NotificationCenter';
+import AdminDashboard from './pages/AdminDashboard';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
@@ -103,6 +104,7 @@ export default function App() {
         {user.role === 'FPO_ADMIN' && <FpoPoolDashboard />}
         {user.role === 'BUYER' && <BuyerAuctionPortal />}
         {user.role === 'LOGISTICS' && <LogisticsTracker />}
+        {user.role === 'ADMIN' && <AdminDashboard />}
       </main>
     </div>
   );

@@ -6,7 +6,9 @@ function verifyToken(req, res, next) {
   if (!token) return res.status(401).json({ success: false, message: 'Authentication required', code: 'UNAUTHORIZED' });
   try {
     const secret = process.env.JWT_SECRET;
-    if (!secret) return res.status(500).json({ success: false, message: 'Server authentication is not configured', code: 'AUTH_CONFIG_ERROR' });
+    if (!secret || Buffer.byteLength(secret, 'utf8') < 32) {
+      return res.status(500).json({ success: false, message: 'Server authentication requires a JWT_SECRET of at least 32 bytes', code: 'AUTH_CONFIG_ERROR' });
+    }
     req.user = jwt.verify(token, secret);
     next();
   } catch {

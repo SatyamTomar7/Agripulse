@@ -2,12 +2,6 @@ import { useEffect, useState } from 'react';
 import axios from 'axios';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
-const demos = [
-  { label: 'Farmer', phone: '9876543210', role: 'FARMER' },
-  { label: 'FPO Admin', phone: '9876543211', role: 'FPO_ADMIN' },
-  { label: 'Buyer', phone: '9876543212', role: 'BUYER' },
-  { label: 'Logistics', phone: '9876543213', role: 'LOGISTICS' }
-];
 
 export default function Login({ onLogin }) {
   const [mode, setMode] = useState('login');
@@ -33,13 +27,17 @@ export default function Login({ onLogin }) {
         ? { phone: phone.trim(), password }
         : { fullName: fullName.trim(), phone: phone.trim(), password, role, districtId: districtId.trim().toUpperCase(), stateName, village, address };
       const response = await axios.post(`${API}/api/v1/auth/${endpoint}`, payload);
+      if (response.data.pendingApproval) {
+        setError(response.data.message);
+        setMode('login');
+        return;
+      }
       localStorage.setItem('agripulse_token', response.data.token);
       localStorage.setItem('agripulse_refresh_token', response.data.refreshToken);
       localStorage.setItem('agripulse_user', JSON.stringify(response.data.user));
       onLogin(response.data.user);
     } catch (err) { setError(err.response?.data?.message || `Unable to ${mode}`); }
   };
-  const fill = demo => { setPhone(demo.phone); setPassword('Password@123'); };
   const switchMode = nextMode => {
     setMode(nextMode);
     setError('');
@@ -80,9 +78,7 @@ export default function Login({ onLogin }) {
             <input aria-label="Password" name="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} required minLength={8} type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password (min. 8 characters)" className="w-full rounded-lg border px-4 py-3"/>
             {error && <p className="text-sm font-semibold text-red-600">{error}</p>}
             <button type="submit" className="w-full rounded-lg bg-emerald-700 px-4 py-3 font-bold text-white">{mode === 'login' ? 'Login' : 'Create account'}</button>
-            {mode === 'login' && <div className="grid grid-cols-2 gap-2">
-              {demos.map(demo => <button type="button" key={demo.role} onClick={() => fill(demo)} className="rounded-lg border border-emerald-200 px-2 py-2 text-xs font-bold text-emerald-800">Quick Demo Fill · {demo.label}</button>)}
-            </div>}
+            {mode === 'register' && role !== 'FARMER' && <p className="text-xs text-slate-500">This role requires administrator approval before sign-in.</p>}
           </form>
         </div>
       </div>

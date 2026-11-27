@@ -71,16 +71,17 @@ export default function FpoPoolDashboard() {
       </div>}
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">{lots.map(l=>{
         const allowed = !compatible || (compatible.crop_code===l.crop_code && compatible.grade===l.grade);
-        const qualityStatus = l.quality_card?.assessmentStatus || 'SUBMITTED';
+        const qualityStatus = l.quality_card?.assessmentStatus || 'NOT_SUBMITTED';
         return <article key={l.id} className={`rounded-xl border bg-white p-4 shadow-sm ${selected.includes(l.id)?'ring-2 ring-emerald-600':''}`}>
           <label><input type="checkbox" checked={selected.includes(l.id)} disabled={!allowed || qualityStatus !== 'VERIFIED'} onChange={()=>toggle(l.id)} className="mr-3"/><b>{l.lot_code}</b></label>
           <p className="mt-2 text-sm text-slate-600">{l.crop_code} · Grade {l.grade} · {l.quantity_quintals} quintals</p>
           <p className="mt-1 text-xs text-slate-500">{l.district_id} · Floor ₹{l.recommended_floor_inr}</p>
           <p className="mt-2 text-xs font-bold">Quality: {qualityStatus}</p>
-          {qualityStatus !== 'VERIFIED' && <div className="mt-3 flex gap-2">
+          {qualityStatus === 'SUBMITTED' && <div className="mt-3 flex gap-2">
             <button onClick={()=>verifyQuality(l,'VERIFIED')} className="rounded bg-emerald-700 px-3 py-1 text-xs font-bold text-white">Verify</button>
             <button onClick={()=>verifyQuality(l,'REJECTED')} className="rounded border border-red-400 px-3 py-1 text-xs font-bold text-red-700">Reject</button>
           </div>}
+          {qualityStatus === 'NOT_SUBMITTED' && <p className="mt-2 text-xs text-slate-500">Awaiting farmer quality submission.</p>}
         </article>;
       })}</div>
     </section>

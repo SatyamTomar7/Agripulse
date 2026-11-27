@@ -58,7 +58,8 @@ export default function NotificationCenter() {
       </div>
       <div className="mt-4 border-t pt-3">
         <p className="text-xs font-black">Channels</p>
-        {['in_app','sms','email','push'].map(channel=><label key={channel} className="mt-1 flex items-center gap-2 text-xs capitalize"><input type="checkbox" checked={preferences[channel]===true} onChange={e=>savePreferences({...preferences,[channel]:e.target.checked})}/>{channel.replace('_',' ')}</label>)}
+        <label className="mt-1 flex items-center gap-2 text-xs capitalize"><input type="checkbox" checked={preferences.in_app===true} onChange={e=>savePreferences({...preferences,in_app:e.target.checked,sms:false,email:false,push:false})}/>In-app</label>
+        <p className="mt-2 text-xs text-slate-500">SMS, email, and push delivery are unavailable until providers are configured.</p>
       </div>
     </div>}
   </div>;

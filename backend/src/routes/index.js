@@ -11,9 +11,14 @@ const priceCache = require('../services/priceCacheService');
 const router = express.Router();
 const authSecret = () => {
   const secret = process.env.JWT_SECRET;
-  if (process.env.NODE_ENV === 'production' && !secret) throw Object.assign(new Error('Server authentication is not configured'), { status: 500, code: 'AUTH_CONFIG_ERROR' });
-  return secret || 'development-secret';
+  if (!secret) throw Object.assign(new Error('Server authentication is not configured'), { status: 500, code: 'AUTH_CONFIG_ERROR' });
+  if (Buffer.byteLength(secret, 'utf8') < 32) throw Object.assign(new Error('JWT_SECRET must be at least 32 bytes'), { status:500, code:'AUTH_CONFIG_ERROR' });
+  return secret;
 };
+const paymentGatewayUnavailable = () => Object.assign(
+  new Error('Payment gateway integration is not configured; no funds have been moved'),
+  { status:503, code:'PAYMENT_GATEWAY_UNAVAILABLE' }
+);
 const tokenFor = user => jwt.sign(
   { id: user.id, phone: user.phone, role: user.role, districtId: user.district_id },
   authSecret(),
@@ -57,7 +62,7 @@ const optionalAuth = (req, res, next) => {
 
 const notify = async (userId, eventType, englishTitle, englishBody, data = {}) => {
   const userResult = await query(
-    `SELECT u.preferred_lang,p.in_app,p.sms,p.email,p.push
+    `SELECT u.preferred_lang,p.in_app
      FROM users u LEFT JOIN notification_preferences p ON p.user_id=u.id
      WHERE u.id=$1`,
     [userId]
@@ -74,21 +79,6 @@ const notify = async (userId, eventType, englishTitle, englishBody, data = {}) =
       [userId,eventType,title,body,JSON.stringify(data)]
     );
   }
-  if (user.sms) await query(
-    `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
-     VALUES($1,'SMS',$2,$3,$4,$5,'PENDING')`,
-    [userId,eventType,title,body,JSON.stringify(data)]
-  );
-  if (user.email) await query(
-    `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
-     VALUES($1,'EMAIL',$2,$3,$4,$5,'PENDING')`,
-    [userId,eventType,title,body,JSON.stringify(data)]
-  );
-  if (user.push) await query(
-    `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
-     VALUES($1,'PUSH',$2,$3,$4,$5,'PENDING')`,
-    [userId,eventType,title,body,JSON.stringify(data)]
-  );
 };
 
 router.get('/master-data', async (req, res, next) => {
@@ -129,6 +119,9 @@ router.post('/auth/register', async (req, res, next) => {
       throw err;
     }
     const user = result.rows[0];
+    if (user.account_status !== 'APPROVED') {
+      return res.status(201).json({ success:true, pendingApproval:true, message:'Your account is awaiting approval' });
+    }
     res.status(201).json(await authResponse(user));
   } catch (err) { next(err); }
 });
@@ -206,18 +199,17 @@ router.get('/auth/me', verifyToken, async (req, res, next) => {
 router.patch('/auth/me', verifyToken, async (req, res, next) => {
   try {
     const fullName = req.body.fullName?.trim();
-    const districtId = req.body.districtId?.trim().toUpperCase();
+    const requestedDistrictId = req.body.districtId?.trim().toUpperCase();
     const preferredLang = req.body.preferredLang?.toLowerCase();
     const stateName = req.body.stateName?.trim();
     const village = req.body.village?.trim();
     const address = req.body.address?.trim();
     const bankAccountLast4 = req.body.bankAccountLast4?.trim();
     const kycStatus = req.body.kycStatus;
-    if (fullName !== undefined && (fullName.length < 2 || fullName.length > 120)) throw Object.assign(new Error('Full name must contain 2 to 120 characters'), { status: 400 });
-    if (districtId !== undefined) {
-      const district = await query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [districtId]);
-      if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400, code: 'INVALID_DISTRICT' });
+    if (requestedDistrictId !== undefined && requestedDistrictId !== req.user.districtId) {
+      throw Object.assign(new Error('District changes require administrator review'), { status:403, code:'DISTRICT_CHANGE_REQUIRES_REVIEW' });
     }
+    if (fullName !== undefined && (fullName.length < 2 || fullName.length > 120)) throw Object.assign(new Error('Full name must contain 2 to 120 characters'), { status: 400 });
     if (preferredLang !== undefined && !['en', 'hi'].includes(preferredLang)) throw Object.assign(new Error('Unsupported language'), { status: 400 });
     if (bankAccountLast4 !== undefined && bankAccountLast4 && !/^\d{4}$/.test(bankAccountLast4)) throw Object.assign(new Error('Bank account suffix must contain exactly 4 digits'), { status: 400 });
     if (kycStatus !== undefined && kycStatus !== 'PENDING' && kycStatus !== 'SUBMITTED') throw Object.assign(new Error('Only KYC submission status may be set by a user'), { status: 403 });
@@ -232,7 +224,7 @@ router.patch('/auth/me', verifyToken, async (req, res, next) => {
        bank_account_last4=COALESCE($7,bank_account_last4),
        kyc_status=COALESCE($8,kyc_status)
        WHERE id=$9 RETURNING *`,
-      [fullName ?? null, districtId ?? null, preferredLang ?? null, stateName ?? null, village ?? null, address ?? null,
+      [fullName ?? null, null, preferredLang ?? null, stateName ?? null, village ?? null, address ?? null,
        bankAccountLast4 ?? null, kycStatus ?? null, req.user.id]
     );
     res.json({ user: publicUser(result.rows[0]) });
@@ -245,12 +237,15 @@ router.get('/notifications/preferences', verifyToken, async (req, res, next) => 
       'SELECT in_app,sms,email,push,quiet_start,quiet_end FROM notification_preferences WHERE user_id=$1',
       [req.user.id]
     );
-    res.json({ preferences:result.rows[0] || { in_app:true,sms:false,email:false,push:false } });
+    res.json({ preferences:{ ...(result.rows[0] || { in_app:true }), sms:false,email:false,push:false } });
   } catch (err) { next(err); }
 });
 
 router.put('/notifications/preferences', verifyToken, async (req, res, next) => {
   try {
+    if (req.body.sms === true || req.body.email === true || req.body.push === true) {
+      throw Object.assign(new Error('SMS, email, and push providers are not configured'), { status:503, code:'NOTIFICATION_PROVIDER_UNAVAILABLE' });
+    }
     const result = await query(
       `INSERT INTO notification_preferences(user_id,in_app,sms,email,push,quiet_start,quiet_end)
        VALUES($1,$2,$3,$4,$5,$6,$7)
@@ -373,7 +368,7 @@ router.get('/advisory/nearby-prices', async (req, res, next) => {
     validatePrice(cropCode, 'A', 11);
     if (!districtId) throw Object.assign(new Error('districtId is required'), { status: 400 });
     const result = await query(
-      `SELECT district_id,modal_price_inr,msp_inr,arrival_quintals,updated_at
+      `SELECT district_id,modal_price_inr,msp_inr,arrival_quintals,updated_at,source
        FROM mandi_prices WHERE crop_code=$1 ORDER BY ABS(arrival_quintals) DESC,updated_at DESC`,
       [cropCode]
     );
@@ -386,7 +381,7 @@ router.get('/advisory/nearby-prices', async (req, res, next) => {
         mspInr: Number(row.msp_inr),
         arrivalQuintals: Number(row.arrival_quintals),
         updatedAt: row.updated_at,
-        source: 'AGMARKNET/Mandi data'
+        source: row.source
       }))
     });
   } catch (err) { next(err); }
@@ -398,6 +393,7 @@ router.put('/admin/mandi-prices/:districtId/:cropCode', verifyToken, requireRole
     const { modalPriceInr, mspInr, arrivalQuintals, source } = req.body;
     const values = [modalPriceInr, mspInr, arrivalQuintals];
     if (values.some(value => !Number.isFinite(Number(value)) || Number(value) < 0)) throw Object.assign(new Error('Invalid mandi price values'), { status: 400 });
+    const sourceLabel = typeof source === 'string' && source.trim() ? source.trim().slice(0,120) : 'ADMIN-MANUAL';
     validatePrice(cropCode, 'A', 11);
     const district = await query('SELECT code FROM districts WHERE code=$1 AND active=TRUE', [districtId]);
     if (!district.rows.length) throw Object.assign(new Error('Invalid district'), { status: 400, code: 'INVALID_DISTRICT' });
@@ -405,16 +401,16 @@ router.put('/admin/mandi-prices/:districtId/:cropCode', verifyToken, requireRole
     try {
       await client.query('BEGIN');
       await client.query(
-        `INSERT INTO mandi_prices(district_id,crop_code,modal_price_inr,msp_inr,arrival_quintals,updated_at)
-         VALUES($1,$2,$3,$4,$5,NOW())
+        `INSERT INTO mandi_prices(district_id,crop_code,modal_price_inr,msp_inr,arrival_quintals,source,updated_at)
+         VALUES($1,$2,$3,$4,$5,$6,NOW())
          ON CONFLICT(district_id,crop_code) DO UPDATE SET modal_price_inr=EXCLUDED.modal_price_inr,
-         msp_inr=EXCLUDED.msp_inr,arrival_quintals=EXCLUDED.arrival_quintals,updated_at=NOW()`,
-        [districtId, cropCode, modalPriceInr, mspInr, arrivalQuintals || 0]
+         msp_inr=EXCLUDED.msp_inr,arrival_quintals=EXCLUDED.arrival_quintals,source=EXCLUDED.source,updated_at=NOW()`,
+        [districtId, cropCode, modalPriceInr, mspInr, arrivalQuintals || 0, sourceLabel]
       );
       await client.query(
         `INSERT INTO mandi_price_history(district_id,crop_code,modal_price_inr,msp_inr,arrival_quintals,source,changed_by,effective_at)
          VALUES($1,$2,$3,$4,$5,$6,$7,NOW())`,
-        [districtId, cropCode, modalPriceInr, mspInr, arrivalQuintals || 0, source?.trim() || 'ADMIN', req.user.id]
+        [districtId, cropCode, modalPriceInr, mspInr, arrivalQuintals || 0, sourceLabel, req.user.id]
       );
       await client.query('COMMIT');
       priceCache._cache.clear();
@@ -467,7 +463,7 @@ router.post('/lots/sync', verifyToken, requireRole('FARMER','FPO_ADMIN'), async 
            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
            ON CONFLICT(client_event_id) DO NOTHING RETURNING *`,
           [lotCode, lot.clientEventId, req.user.id, lot.cropCode, lot.quantityQuintals, lot.moisturePct, lot.grade, lot.districtId,
-           floor.recommendedFloorInr, JSON.stringify({ ...(lot.qualityCard || {}), assessmentStatus:'SUBMITTED' }), lot.capturedAt]
+           floor.recommendedFloorInr, JSON.stringify({ ...(lot.qualityCard || {}), assessmentStatus:'NOT_SUBMITTED' }), lot.capturedAt]
         );
         if (!insert.rows.length) continue;
         const created = insert.rows[0];
@@ -505,6 +501,12 @@ router.get('/lots/export/csv', verifyToken, async (req, res, next) => {
     } else if (req.user.role === 'FPO_ADMIN') {
       params.push(req.user.districtId);
       conditions.push(`district_id=$${params.length}`);
+    } else if (req.user.role === 'BUYER') {
+      params.push(req.user.id);
+      conditions.push(`EXISTS (SELECT 1 FROM auctions a WHERE a.lot_id=crop_lots.id AND a.highest_bidder_id=$${params.length})`);
+    } else if (req.user.role === 'LOGISTICS') {
+      params.push(req.user.id);
+      conditions.push(`EXISTS (SELECT 1 FROM escrow_dispatches d WHERE d.auction_id IN (SELECT id FROM auctions WHERE lot_id=crop_lots.id) AND d.logistics_user_id=$${params.length})`);
     }
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const result = await query(`SELECT lot_code,crop_code,quantity_quintals,moisture_pct,grade,district_id,status,recommended_floor_inr FROM crop_lots ${where} ORDER BY id`, params);
@@ -516,12 +518,30 @@ router.get('/lots/export/csv', verifyToken, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.get('/lots', optionalAuth, async (req, res, next) => {
+router.get('/lots', verifyToken, async (req, res, next) => {
   try {
     const conditions = [], params = [];
+    if (req.user.role === 'FARMER') {
+      params.push(req.user.id);
+      conditions.push(`farmer_id=$${params.length}`);
+    } else if (req.user.role === 'FPO_ADMIN') {
+      params.push(req.user.districtId);
+      conditions.push(`district_id=$${params.length}`);
+    } else if (req.user.role === 'BUYER') {
+      conditions.push(`status='IN_AUCTION'`);
+    } else if (!['ADMIN','LOGISTICS'].includes(req.user.role)) {
+      throw Object.assign(new Error('Forbidden'), { status:403 });
+    }
     if (req.query.status) { params.push(req.query.status); conditions.push(`status=$${params.length}`); }
-    if (req.query.districtId) { params.push(req.query.districtId); conditions.push(`district_id=$${params.length}`); }
-    if (req.query.mine === 'true' && req.user?.id) { params.push(req.user.id); conditions.push(`farmer_id=$${params.length}`); }
+    if (req.query.districtId && ['FPO_ADMIN','ADMIN'].includes(req.user.role)) {
+      if (req.user.role === 'FPO_ADMIN' && req.query.districtId !== req.user.districtId) throw Object.assign(new Error('Forbidden'), { status:403 });
+      params.push(req.query.districtId);
+      conditions.push(`district_id=$${params.length}`);
+    }
+    if (req.user.role === 'LOGISTICS') {
+      params.push(req.user.id);
+      conditions.push(`EXISTS (SELECT 1 FROM escrow_dispatches d JOIN auctions a ON a.id=d.auction_id WHERE a.lot_id=crop_lots.id AND d.logistics_user_id=$${params.length})`);
+    }
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const result = await query(`SELECT * FROM crop_lots ${where} ORDER BY id DESC`, params);
     res.json({ lots: result.rows });
@@ -536,7 +556,15 @@ router.get('/lots/:lotId', verifyToken, async (req, res, next) => {
     if (!result.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
     const lot = result.rows[0];
     if (req.user.role === 'FARMER' && lot.farmer_id !== req.user.id) throw Object.assign(new Error('Forbidden'), { status: 403 });
-    if (req.user.role === 'FPO_ADMIN' && lot.farmer_id !== req.user.id && lot.fpo_batch_id === null) throw Object.assign(new Error('Forbidden'), { status: 403 });
+    if (req.user.role === 'FPO_ADMIN' && lot.district_id !== req.user.districtId) throw Object.assign(new Error('Forbidden'), { status: 403 });
+    if (req.user.role === 'BUYER' && lot.status !== 'IN_AUCTION') throw Object.assign(new Error('Forbidden'), { status: 403 });
+    if (req.user.role === 'LOGISTICS') {
+      const assigned = await query(
+        'SELECT 1 FROM escrow_dispatches d JOIN auctions a ON a.id=d.auction_id WHERE a.lot_id=$1 AND d.logistics_user_id=$2',
+        [lotId,req.user.id]
+      );
+      if (!assigned.rows.length) throw Object.assign(new Error('Forbidden'), { status:403 });
+    }
     const history = await query(
       'SELECT previous_status,new_status,changed_by,reason,changed_at FROM lot_status_history WHERE lot_id=$1 ORDER BY changed_at DESC',
       [lotId]
@@ -616,12 +644,13 @@ router.post('/lots/:lotId/relist', verifyToken, requireRole('FARMER','FPO_ADMIN'
   } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
 
-router.post('/lots/:lotId/quality', verifyToken, requireRole('FARMER','FPO_ADMIN'), async (req, res, next) => {
+router.post('/lots/:lotId/quality', verifyToken, requireRole('FARMER'), async (req, res, next) => {
   const lotId = Number(req.params.lotId);
   if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status: 400 });
   const lot = await query('SELECT * FROM crop_lots WHERE id=$1', [lotId]);
   if (!lot.rows.length) throw Object.assign(new Error('Lot not found'), { status: 404 });
-  if (req.user.role === 'FARMER' && lot.rows[0].farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+  if (lot.rows[0].farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status: 403 });
+  if (!['LISTED','DRAFT'].includes(lot.rows[0].status)) throw Object.assign(new Error('Quality cannot be changed after auction listing'), { status:409 });
   const { moisturePct, grade, foreignMatterPct, brokenGrainPct, certificateNo, notes } = req.body;
   validatePrice(lot.rows[0].crop_code, grade, moisturePct);
   for (const value of [foreignMatterPct, brokenGrainPct]) {
@@ -650,8 +679,15 @@ router.patch('/lots/:lotId/quality/:status', verifyToken, requireRole('FPO_ADMIN
   const status = req.params.status.toUpperCase();
   if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status: 400 });
   if (!['VERIFIED','REJECTED'].includes(status)) throw Object.assign(new Error('Invalid verification status'), { status: 400 });
-  const assessment = await query('SELECT * FROM quality_assessments WHERE lot_id=$1', [lotId]);
+  const assessment = await query(
+    `SELECT qa.*,l.district_id,l.farmer_id,l.status AS lot_status
+     FROM quality_assessments qa JOIN crop_lots l ON l.id=qa.lot_id WHERE qa.lot_id=$1`,
+    [lotId]
+  );
   if (!assessment.rows.length) throw Object.assign(new Error('Quality assessment not found'), { status: 404 });
+  if (assessment.rows[0].district_id !== req.user.districtId) throw Object.assign(new Error('Lot is outside your FPO district'), { status:403 });
+  if (assessment.rows[0].lot_status !== 'LISTED') throw Object.assign(new Error('Quality can only be verified for listed lots'), { status:409 });
+  if (assessment.rows[0].status !== 'SUBMITTED') throw Object.assign(new Error('Only submitted assessments can be verified'), { status:409 });
   const result = await query(
     `UPDATE quality_assessments SET status=$1,verified_at=NOW(),assessor_id=COALESCE(assessor_id,$3) WHERE lot_id=$2 RETURNING *`,
     [status, lotId, req.user.id]
@@ -669,6 +705,56 @@ router.patch('/lots/:lotId/quality/:status', verifyToken, requireRole('FPO_ADMIN
     {en:`Quality assessment for ${lotResult.rows[0].lot_code} is ${status.toLowerCase()}`,hi:`${lotResult.rows[0].lot_code} की गुणवत्ता ${status === 'VERIFIED' ? 'सत्यापित' : 'अस्वीकृत'} है`},
     {lotId,lotCode:lotResult.rows[0].lot_code,status});
   res.json({ assessment: result.rows[0] });
+});
+
+router.post('/lots/:lotId/auction', verifyToken, requireRole('FARMER'), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lotId = Number(req.params.lotId);
+    if (!Number.isInteger(lotId) || lotId < 1) throw Object.assign(new Error('Invalid lot ID'), { status:400 });
+    const lotResult = await client.query('SELECT * FROM crop_lots WHERE id=$1 FOR UPDATE', [lotId]);
+    if (!lotResult.rows.length) throw Object.assign(new Error('Lot not found'), { status:404 });
+    const lot = lotResult.rows[0];
+    if (req.user.role === 'FARMER' && lot.farmer_id !== req.user.id) throw Object.assign(new Error('You do not own this lot'), { status:403 });
+    if (lot.status !== 'LISTED') throw Object.assign(new Error('Only listed lots can enter an auction'), { status:409, code:'LOT_NOT_LISTED' });
+    if (lot.quality_card?.assessmentStatus !== 'VERIFIED') throw Object.assign(new Error('Quality assessment must be verified before auction'), { status:409, code:'QUALITY_NOT_VERIFIED' });
+    const priorAuction = await client.query('SELECT * FROM auctions WHERE lot_id=$1 FOR UPDATE', [lotId]);
+    if (priorAuction.rows.length && (priorAuction.rows[0].status !== 'CLOSED' || priorAuction.rows[0].highest_bidder_id)) {
+      throw Object.assign(new Error('This lot already has an active or completed auction'), { status:409, code:'AUCTION_EXISTS' });
+    }
+    const durationSeconds = Number(req.body.durationSeconds || 86400);
+    const minIncrement = Number(req.body.minIncrementInr || 25);
+    const reservePrice = Number(req.body.reservePriceInr || lot.recommended_floor_inr);
+    if (!Number.isInteger(durationSeconds) || durationSeconds < 300 || durationSeconds > 604800) throw Object.assign(new Error('Auction duration must be between 5 minutes and 7 days'), { status:400 });
+    if (!Number.isFinite(minIncrement) || minIncrement <= 0) throw Object.assign(new Error('Minimum increment must be positive'), { status:400 });
+    if (!Number.isFinite(reservePrice) || reservePrice < Number(lot.recommended_floor_inr)) throw Object.assign(new Error('Reserve cannot be below the recommended floor'), { status:400 });
+    const auction = priorAuction.rows.length
+      ? await client.query(
+        `UPDATE auctions SET floor_price_inr=$1,current_highest_bid_inr=$1,min_increment_inr=$2,
+         reserve_price_inr=$3,duration_seconds=$4,auto_extend_seconds=300,starts_at=NOW(),
+         ends_at=NOW()+($4 * INTERVAL '1 second'),status='OPEN',highest_bidder_id=NULL
+         WHERE id=$5 RETURNING *`,
+        [lot.recommended_floor_inr,minIncrement,reservePrice,durationSeconds,priorAuction.rows[0].id]
+      )
+      : await client.query(
+        `INSERT INTO auctions(lot_id,floor_price_inr,current_highest_bid_inr,min_increment_inr,reserve_price_inr,
+         duration_seconds,auto_extend_seconds,ends_at)
+         VALUES($1,$2,$2,$3,$4,$5,300,NOW()+($5 * INTERVAL '1 second')) RETURNING *`,
+        [lotId,lot.recommended_floor_inr,minIncrement,reservePrice,durationSeconds]
+      );
+    await client.query("UPDATE crop_lots SET status='IN_AUCTION' WHERE id=$1", [lotId]);
+    await client.query(
+      "INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,'LISTED','IN_AUCTION',$2,'Auction created by lot owner')",
+      [lotId,req.user.id]
+    );
+    await client.query('COMMIT');
+    req.app.get('io')?.emit('lot:created', { lotId, auctionId:auction.rows[0].id });
+    res.status(201).json({ auction:auction.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally { client.release(); }
 });
 
 router.post('/lots/pool/preview', verifyToken, requireRole('FPO_ADMIN'), async (req, res, next) => {
@@ -754,14 +840,16 @@ router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res
     );
     await client.query(
       'INSERT INTO lot_status_history(lot_id,previous_status,new_status,changed_by,reason) VALUES($1,$2,$3,$4,$5)',
-      [created.rows[0].id, 'LISTED', 'IN_AUCTION', req.user.id, 'FPO pool auction created']
+      [created.rows[0].id, null, 'IN_AUCTION', req.user.id, 'FPO pool auction created']
     );
-    const durationSeconds = Number.isInteger(Number(req.body.durationSeconds)) && Number(req.body.durationSeconds) >= 300
-      ? Number(req.body.durationSeconds) : 86400;
-    const minIncrement = Number(req.body.minIncrementInr) > 0 ? Number(req.body.minIncrementInr) : 25;
-    const reservePrice = req.body.reservePriceInr != null && Number(req.body.reservePriceInr) > 0 ? Number(req.body.reservePriceInr) : floor;
-    const autoExtendSeconds = Number.isInteger(Number(req.body.autoExtendSeconds)) && Number(req.body.autoExtendSeconds) >= 60
-      ? Number(req.body.autoExtendSeconds) : 300;
+    const durationSeconds = Number(req.body.durationSeconds ?? 86400);
+    const minIncrement = Number(req.body.minIncrementInr ?? 25);
+    const reservePrice = Number(req.body.reservePriceInr ?? floor);
+    const autoExtendSeconds = Number(req.body.autoExtendSeconds ?? 300);
+    if (!Number.isInteger(durationSeconds) || durationSeconds < 300 || durationSeconds > 604800) throw Object.assign(new Error('Auction duration must be between 5 minutes and 7 days'), { status:400 });
+    if (!Number.isFinite(minIncrement) || minIncrement <= 0) throw Object.assign(new Error('Minimum increment must be positive'), { status:400 });
+    if (!Number.isFinite(reservePrice) || reservePrice < floor) throw Object.assign(new Error('Reserve cannot be below the recommended floor'), { status:400 });
+    if (!Number.isInteger(autoExtendSeconds) || autoExtendSeconds < 60 || autoExtendSeconds > 3600) throw Object.assign(new Error('Auto extension must be between 1 minute and 1 hour'), { status:400 });
     await client.query(
       `INSERT INTO auctions(lot_id,floor_price_inr,current_highest_bid_inr,min_increment_inr,reserve_price_inr,duration_seconds,auto_extend_seconds,ends_at)
        VALUES($1,$2,$2,$3,$4,$5,$6,NOW()+($5 * INTERVAL '1 second'))`,
@@ -774,7 +862,9 @@ router.post('/lots/pool', verifyToken, requireRole('FPO_ADMIN'), async (req, res
 
 router.get('/auctions', async (req, res, next) => {
   try {
-    const result = await query(`SELECT a.*, l.lot_code,l.crop_code,l.quantity_quintals,l.moisture_pct,l.grade,l.district_id
+    const result = await query(`SELECT a.id,a.lot_id,a.floor_price_inr,a.current_highest_bid_inr,a.min_increment_inr,
+       a.duration_seconds,a.auto_extend_seconds,a.starts_at,a.status,a.ends_at,
+       l.lot_code,l.crop_code,l.quantity_quintals,l.moisture_pct,l.grade,l.district_id
       FROM auctions a JOIN crop_lots l ON l.id=a.lot_id WHERE a.status='OPEN' ORDER BY a.ends_at`);
     res.json({ auctions: result.rows });
   } catch (err) { next(err); }
@@ -834,7 +924,8 @@ router.get('/auctions/:auctionId/bids', verifyToken, async (req, res, next) => {
     const auctionId = Number(req.params.auctionId);
     if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
     const result = await query(
-      `SELECT b.id,b.bid_amount_inr,b.created_at,u.full_name,u.id AS bidder_id
+      `SELECT b.id,b.bid_amount_inr,b.created_at,
+       'Bidder '||DENSE_RANK() OVER (ORDER BY b.bidder_id)::text AS bidder_label
        FROM bids b JOIN users u ON u.id=b.bidder_id
        WHERE b.auction_id=$1
        ORDER BY b.bid_amount_inr DESC,b.created_at DESC`,
@@ -893,13 +984,27 @@ router.get('/dispatches', verifyToken, async (req, res, next) => {
     const params = [];
     let where = '';
     if (req.user?.role === 'BUYER') {
-      params.push(req.user.id); where = `WHERE buyer_id=$${params.length}`;
+      params.push(req.user.id); where = `WHERE d.buyer_id=$${params.length}`;
     } else if (req.user?.role === 'FARMER') {
-      params.push(req.user.id); where = `WHERE farmer_id=$${params.length}`;
+      params.push(req.user.id); where = `WHERE d.farmer_id=$${params.length}`;
     } else if (req.user?.role === 'LOGISTICS') {
-      params.push(req.user.id); where = `WHERE logistics_user_id=$${params.length}`;
+      params.push(req.user.id); where = `WHERE d.logistics_user_id=$${params.length}`;
+    } else if (req.user?.role === 'FPO_ADMIN') {
+      params.push(req.user.districtId);
+      where = `WHERE l.district_id=$${params.length}`;
+    } else if (req.user?.role !== 'ADMIN') {
+      throw Object.assign(new Error('Forbidden'), { status:403 });
     }
-    const result = await query(`SELECT * FROM escrow_dispatches ${where} ORDER BY id DESC`, params);
+    const result = await query(
+      `SELECT d.id,d.auction_id,d.buyer_id,d.farmer_id,d.logistics_user_id,d.total_amount_inr,
+       d.escrow_status,d.logistics_status,d.vehicle_number,d.origin_address,d.destination_address,
+       d.expected_delivery_at,d.pickup_lat,d.pickup_lng,d.delivery_lat,d.delivery_lng,
+       d.current_lat,d.current_lng,d.updated_at FROM escrow_dispatches d
+       JOIN auctions a ON a.id=d.auction_id JOIN crop_lots l ON l.id=a.lot_id
+       ${where}
+       ORDER BY d.id DESC`,
+      params
+    );
     res.json({ dispatches: result.rows });
   } catch (err) { next(err); }
 });
@@ -920,88 +1025,10 @@ router.get('/dispatches/:id/history', verifyToken, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.post('/payments/authorize', verifyToken, requireRole('BUYER'), async (req, res, next) => {
-  try {
-    const auctionId = Number(req.body.auctionId);
-    if (!Number.isInteger(auctionId) || auctionId < 1) throw Object.assign(new Error('Invalid auction ID'), { status: 400 });
-    const result = await query(
-      `SELECT pt.*,a.status AS auction_status,a.highest_bidder_id
-       FROM payment_transactions pt JOIN auctions a ON a.id=pt.auction_id
-       WHERE pt.auction_id=$1`,
-      [auctionId]
-    );
-    if (!result.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
-    const payment = result.rows[0];
-    if (payment.buyer_id !== req.user.id || payment.highest_bidder_id !== req.user.id) throw Object.assign(new Error('You are not the winning buyer'), { status: 403 });
-    if (!['PENDING','FAILED'].includes(payment.status)) throw Object.assign(new Error('Payment is already authorized or processed'), { status: 409 });
-    const providerReference = req.body.providerReference?.trim() || `AP-${crypto.randomUUID()}`;
-    const resultUpdate = await query(
-      `UPDATE payment_transactions SET status='AUTHORIZED',provider='${String(req.body.provider || 'MANUAL').replace(/[^A-Za-z0-9_-]/g,'').slice(0,30)}',
-       provider_reference=$1,provider_payload=$2,updated_at=NOW() WHERE id=$3 RETURNING *`,
-      [providerReference, JSON.stringify(req.body.providerPayload || {}), payment.id]
-    );
-    res.json({ payment:resultUpdate.rows[0] });
-  } catch (err) { next(err); }
-});
-
-router.post('/payments/:transactionId/capture', verifyToken, requireRole('BUYER'), async (req, res, next) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const id = Number(req.params.transactionId);
-    const paymentResult = await client.query('SELECT * FROM payment_transactions WHERE id=$1 FOR UPDATE', [id]);
-    if (!paymentResult.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
-    const payment = paymentResult.rows[0];
-    if (payment.buyer_id !== req.user.id) throw Object.assign(new Error('Forbidden'), { status: 403 });
-    if (!['AUTHORIZED','PENDING'].includes(payment.status)) throw Object.assign(new Error(`Payment cannot be captured from ${payment.status}`), { status: 409 });
-    const updated = await client.query(
-      `UPDATE payment_transactions SET status='LOCKED',updated_at=NOW() WHERE id=$1 RETURNING *`,
-      [id]
-    );
-    await client.query(
-      `UPDATE escrow_dispatches SET escrow_status='LOCKED',updated_at=NOW()
-       WHERE auction_id=$1`,
-      [payment.auction_id]
-    );
-    await client.query('COMMIT');
-    res.json({ payment:updated.rows[0] });
-  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
-});
-
-router.post('/payments/:transactionId/refund', verifyToken, requireRole('BUYER','ADMIN'), async (req, res, next) => {
-  try {
-    const id = Number(req.params.transactionId);
-    const paymentResult = await query('SELECT * FROM payment_transactions WHERE id=$1', [id]);
-    if (!paymentResult.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
-    const payment = paymentResult.rows[0];
-    if (req.user.role !== 'ADMIN' && payment.buyer_id !== req.user.id) throw Object.assign(new Error('Forbidden'), { status: 403 });
-    if (!['LOCKED','AUTHORIZED','CAPTURED'].includes(payment.status)) throw Object.assign(new Error(`Payment cannot be refunded from ${payment.status}`), { status: 409 });
-    const result = await query(
-      `UPDATE payment_transactions SET status='REFUND_PENDING',provider_payload=provider_payload||$1,updated_at=NOW() WHERE id=$2 RETURNING *`,
-      [JSON.stringify({ refundReason:req.body.reason?.trim() || 'Buyer refund requested' }), id]
-    );
-    await query(`UPDATE escrow_dispatches SET escrow_status='REFUNDED',updated_at=NOW() WHERE auction_id=$1`, [payment.auction_id]);
-    res.json({ payment:result.rows[0] });
-  } catch (err) { next(err); }
-});
-
-router.post('/payments/:transactionId/release', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const id = Number(req.params.transactionId);
-    const paymentResult = await client.query('SELECT * FROM payment_transactions WHERE id=$1 FOR UPDATE', [id]);
-    if (!paymentResult.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
-    const payment = paymentResult.rows[0];
-    if (!['LOCKED','CAPTURED'].includes(payment.status)) throw Object.assign(new Error(`Payment cannot be released from ${payment.status}`), { status: 409 });
-    const dispatch = await client.query('SELECT logistics_status FROM escrow_dispatches WHERE auction_id=$1', [payment.auction_id]);
-    if (!dispatch.rows.length || dispatch.rows[0].logistics_status !== 'DELIVERED') throw Object.assign(new Error('Escrow can only be released after delivery'), { status: 409 });
-    const updated = await client.query(`UPDATE payment_transactions SET status='RELEASED',updated_at=NOW() WHERE id=$1 RETURNING *`, [id]);
-    await client.query(`UPDATE escrow_dispatches SET escrow_status='RELEASED',updated_at=NOW() WHERE auction_id=$1`, [payment.auction_id]);
-    await client.query('COMMIT');
-    res.json({ payment:updated.rows[0] });
-  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
-});
+router.post('/payments/authorize', verifyToken, requireRole('BUYER'), (req, res, next) => next(paymentGatewayUnavailable()));
+router.post('/payments/:transactionId/capture', verifyToken, requireRole('BUYER'), (req, res, next) => next(paymentGatewayUnavailable()));
+router.post('/payments/:transactionId/refund', verifyToken, requireRole('BUYER','ADMIN'), (req, res, next) => next(paymentGatewayUnavailable()));
+router.post('/payments/:transactionId/release', verifyToken, requireRole('ADMIN'), (req, res, next) => next(paymentGatewayUnavailable()));
 
 router.get('/payments', verifyToken, async (req, res, next) => {
   try {
@@ -1012,6 +1039,7 @@ router.get('/payments', verifyToken, async (req, res, next) => {
       params.push(req.user.id);
       where=`WHERE ed.farmer_id=$${params.length}`;
     }
+    if (!['ADMIN','BUYER','FARMER'].includes(req.user.role)) throw Object.assign(new Error('Forbidden'), { status:403 });
     const result = await query(
       `SELECT pt.*,ed.farmer_id,ed.logistics_status
        FROM payment_transactions pt LEFT JOIN escrow_dispatches ed ON ed.auction_id=pt.auction_id
@@ -1022,53 +1050,50 @@ router.get('/payments', verifyToken, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.post('/payments/webhook', async (req, res, next) => {
-  try {
-    if (process.env.PAYMENT_WEBHOOK_SECRET) {
-      const supplied = req.headers['x-webhook-secret'];
-      if (supplied !== process.env.PAYMENT_WEBHOOK_SECRET) throw Object.assign(new Error('Invalid webhook secret'), { status: 401 });
-    }
-    const { eventId, providerReference, status } = req.body;
-    if (!providerReference || !status) throw Object.assign(new Error('Invalid payment webhook'), { status: 400 });
-    const allowed = ['AUTHORIZED','CAPTURED','LOCKED','RELEASED','REFUND_PENDING','REFUNDED','FAILED'];
-    if (!allowed.includes(status)) throw Object.assign(new Error('Invalid payment status'), { status: 400 });
-    const payment = await query('SELECT id FROM payment_transactions WHERE provider_reference=$1', [providerReference]);
-    if (!payment.rows.length) throw Object.assign(new Error('Payment not found'), { status: 404 });
-    if (eventId) {
-      const existing = await query('SELECT id FROM payment_events WHERE event_id=$1', [eventId]);
-      if (existing.rows.length) return res.json({ success:true, duplicate:true });
-    }
-    await query('INSERT INTO payment_events(transaction_id,event_id,event_type,payload) VALUES($1,$2,$3,$4)', [
-      payment.rows[0].id, eventId || null, `payment.${status.toLowerCase()}`, JSON.stringify(req.body)
-    ]);
-    await query('UPDATE payment_transactions SET status=$1,provider_payload=provider_payload||$2,updated_at=NOW() WHERE id=$3', [
-      status, JSON.stringify(req.body), payment.rows[0].id
-    ]);
-    res.json({ success:true });
-  } catch (err) { next(err); }
-});
+router.post('/payments/webhook', (req, res, next) => next(paymentGatewayUnavailable()));
 
-router.post('/dispatches/:id/assign', verifyToken, requireRole('ADMIN','FPO_ADMIN'), async (req, res, next) => {
+router.post('/dispatches/:id/assign', verifyToken, requireRole('ADMIN'), async (req, res, next) => {
+  const client = await pool.connect();
   try {
     const id = Number(req.params.id);
     const logisticsUserId = Number(req.body.logisticsUserId);
     if (!Number.isInteger(id) || id < 1 || !Number.isInteger(logisticsUserId) || logisticsUserId < 1) throw Object.assign(new Error('Invalid dispatch or logistics user ID'), { status: 400 });
-    const logistics = await query("SELECT id,role,account_status FROM users WHERE id=$1", [logisticsUserId]);
+    await client.query('BEGIN');
+    const dispatch = await client.query(
+      `SELECT d.*,l.district_id FROM escrow_dispatches d
+       JOIN auctions a ON a.id=d.auction_id JOIN crop_lots l ON l.id=a.lot_id
+       WHERE d.id=$1 FOR UPDATE OF d`,
+      [id]
+    );
+    if (!dispatch.rows.length) throw Object.assign(new Error('Dispatch not found'), { status:404 });
+    if (dispatch.rows[0].logistics_status !== 'PENDING_PICKUP') throw Object.assign(new Error('Only unstarted dispatches can be assigned'), { status:409 });
+    if (!dispatch.rows[0].buyer_id) throw Object.assign(new Error('Dispatch has no buyer to receive a delivery code'), { status:409 });
+    const logistics = await client.query("SELECT id,role,account_status,district_id FROM users WHERE id=$1", [logisticsUserId]);
     if (!logistics.rows.length || logistics.rows[0].role !== 'LOGISTICS') throw Object.assign(new Error('Logistics user not found'), { status: 404 });
     if (logistics.rows[0].account_status !== 'APPROVED') throw Object.assign(new Error('Logistics account is not approved'), { status: 409 });
-    if (!req.body.vehicleNumber || req.body.vehicleNumber.trim().length < 3) throw Object.assign(new Error('Vehicle number is required'), { status: 400 });
-    const otp = String(Math.floor(100000 + crypto.randomInt(900000)));
-    const result = await query(
+    if (logistics.rows[0].district_id !== dispatch.rows[0].district_id) throw Object.assign(new Error('Logistics user must be assigned in the lot district'), { status:400 });
+    if (typeof req.body.vehicleNumber !== 'string' || req.body.vehicleNumber.trim().length < 3) throw Object.assign(new Error('Vehicle number is required'), { status: 400 });
+    if (req.body.expectedDeliveryAt && (typeof req.body.expectedDeliveryAt !== 'string' || Number.isNaN(Date.parse(req.body.expectedDeliveryAt)))) {
+      throw Object.assign(new Error('Invalid expected delivery date'), { status:400 });
+    }
+    const otp = String(crypto.randomInt(100000,1000000));
+    const result = await client.query(
       `UPDATE escrow_dispatches SET logistics_user_id=$1,vehicle_number=$2,origin_address=$3,
        destination_address=$4,expected_delivery_at=$5,delivery_otp_hash=$6,updated_at=NOW()
-       WHERE id=$7 RETURNING *`,
-      [logisticsUserId, req.body.vehicleNumber.trim().toUpperCase(), req.body.originAddress || null,
+       WHERE id=$7 RETURNING id,auction_id,buyer_id,farmer_id,logistics_user_id,total_amount_inr,escrow_status,
+       logistics_status,vehicle_number,origin_address,destination_address,expected_delivery_at,updated_at`,
+      [logisticsUserId, req.body.vehicleNumber.trim().toUpperCase(), dispatch.rows[0].origin_address || req.body.originAddress || null,
        req.body.destinationAddress || null, req.body.expectedDeliveryAt || null,
        crypto.createHash('sha256').update(otp).digest('hex'), id]
     );
-    if (!result.rows.length) throw Object.assign(new Error('Dispatch not found'), { status: 404 });
-    res.status(201).json({ dispatch:result.rows[0], deliveryOtp:otp });
-  } catch (err) { next(err); }
+    await client.query(
+      `INSERT INTO notifications(user_id,channel,event_type,title,body,data,status)
+       VALUES($1,'IN_APP','DELIVERY_OTP','Private delivery code',$2,$3,'PENDING')`,
+      [dispatch.rows[0].buyer_id, `Your delivery code for dispatch #${id} is ${otp}. Share it only with the delivery driver at handoff.`, JSON.stringify({ dispatchId:id })]
+    );
+    await client.query('COMMIT');
+    res.status(201).json({ dispatch:result.rows[0] });
+  } catch (err) { await client.query('ROLLBACK'); next(err); } finally { client.release(); }
 });
 
 router.patch('/dispatches/:id/status', verifyToken, requireRole('LOGISTICS'), async (req, res, next) => {
@@ -1096,7 +1121,10 @@ router.patch('/dispatches/:id/status', verifyToken, requireRole('LOGISTICS'), as
       pickup_lng=CASE WHEN $1='IN_TRANSIT' THEN $4 ELSE pickup_lng END,
       delivery_lat=CASE WHEN $1='DELIVERED' THEN $3 ELSE delivery_lat END,
       delivery_lng=CASE WHEN $1='DELIVERED' THEN $4 ELSE delivery_lng END,
-      updated_at=NOW() WHERE id=$5 RETURNING *`,
+      delivery_otp_hash=CASE WHEN $1='DELIVERED' THEN NULL ELSE delivery_otp_hash END,
+      updated_at=NOW() WHERE id=$5 RETURNING id,auction_id,buyer_id,farmer_id,logistics_user_id,total_amount_inr,
+      escrow_status,logistics_status,vehicle_number,origin_address,destination_address,expected_delivery_at,
+      pickup_lat,pickup_lng,delivery_lat,delivery_lng,current_lat,current_lng,updated_at`,
       [req.body.logisticsStatus, req.body.vehicleNumber, lat, lng, req.params.id]);
     await query(
       'INSERT INTO dispatch_status_history(dispatch_id,previous_status,new_status,changed_by,latitude,longitude,note) VALUES($1,$2,$3,$4,$5,$6,$7)',
